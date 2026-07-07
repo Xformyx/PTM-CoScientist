@@ -1,0 +1,251 @@
+"""
+FastAPI Server for PTM-CoScientist.
+
+Provides REST API for:
+- Running the Co-Scientist pipeline
+- Submitting scientist feedback
+- Retrieving hypothesis results and experiment designs
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+
+from config.settings import get_settings
+from src.core.llm_client import LLMClient
+from src.core.pipeline import CoScientistPipeline
+from src.core.models import CoScientistState
+from src.connectors.chromadb_connector import ChromaDBConnector
+from src.connectors.ptm_platform_connector import PTMPlatformConnector
+from src.agents.experiment_designer import run_experiment_design
+
+logger = logging.getLogger(__name__)
+app = FastAPI(title="PTM-CoScientist", version="0.1.0")
+
+# ─── In-memory state (replace with Redis/DB for production) ──────────────
+_sessions: dict = {}
+
+
+# ─── Request/Response models ─────────────────────────────────────────────
+
+class RunRequest(BaseModel):
+    order_code: str
+    research_goal: str = ""
+    ptm_type: str = "phosphorylation"
+    rag_collections: Optional[List[str]] = None
+    max_iterations: int = 3
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    feedback_type: str = "direction"  # direction | constraint | seed_idea
+    content: str
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+    status: str
+    iteration: int
+    total_hypotheses: int
+    top_hypotheses: list
+    experiment_designs: list
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "ptm-coscientist"}
+
+
+@app.post("/run")
+def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
+    """Start a new Co-Scientist session."""
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+
+    _sessions[session_id] = {
+        "status": "running",
+        "state": None,
+        "request": req.model_dump(),
+    }
+
+    background_tasks.add_task(_execute_pipeline, session_id, req)
+
+    return {"session_id": session_id, "status": "started"}
+
+
+@app.get("/session/{session_id}")
+def get_session(session_id: str) -> SessionResponse:
+    """Get current state of a Co-Scientist session."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _sessions[session_id]
+    state: Optional[CoScientistState] = session.get("state")
+
+    if state is None:
+        return SessionResponse(
+            session_id=session_id,
+            status=session["status"],
+            iteration=0,
+            total_hypotheses=0,
+            top_hypotheses=[],
+            experiment_designs=[],
+        )
+
+    top_hyps = [h.to_dict() for h in state.hypotheses[:10]]
+    exp_designs = [e.to_dict() for e in state.experiment_designs[:10]]
+
+    return SessionResponse(
+        session_id=session_id,
+        status=session["status"],
+        iteration=state.iteration,
+        total_hypotheses=len(state.hypotheses),
+        top_hypotheses=top_hyps,
+        experiment_designs=exp_designs,
+    )
+
+
+@app.post("/session/{session_id}/feedback")
+def submit_feedback(session_id: str, req: FeedbackRequest):
+    """Submit scientist feedback and re-run with updated guidance."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _sessions[session_id]
+    state: Optional[CoScientistState] = session.get("state")
+
+    if state is None:
+        raise HTTPException(status_code=400, detail="Pipeline hasn't completed yet")
+
+    state.scientist_feedback.append({
+        "type": req.feedback_type,
+        "content": req.content,
+    })
+
+    return {
+        "status": "feedback_received",
+        "total_feedback": len(state.scientist_feedback),
+        "message": "Re-run the pipeline to incorporate feedback",
+    }
+
+
+@app.post("/session/{session_id}/design-experiments")
+def design_experiments(session_id: str, top_n: int = 5):
+    """Design experiments for the top hypotheses in a session."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _sessions[session_id]
+    state: Optional[CoScientistState] = session.get("state")
+
+    if state is None or not state.hypotheses:
+        raise HTTPException(status_code=400, detail="No hypotheses available")
+
+    settings = get_settings()
+    llm = _create_llm(settings)
+
+    designs = run_experiment_design(
+        hypotheses=state.hypotheses,
+        llm=llm,
+        experimental_context=state.experimental_context,
+        top_n=top_n,
+    )
+
+    state.experiment_designs = designs
+    return {"designs": [d.to_dict() for d in designs]}
+
+
+# ─── Background task ─────────────────────────────────────────────────────
+
+def _execute_pipeline(session_id: str, req: RunRequest):
+    """Execute the pipeline in background."""
+    try:
+        settings = get_settings()
+        llm = _create_llm(settings)
+        chromadb = ChromaDBConnector(settings.ptm_platform.chromadb_url)
+        ptm_conn = PTMPlatformConnector(
+            artifacts_dir=settings.ptm_platform.artifacts_dir,
+            database_url=settings.ptm_platform.database_url,
+        )
+
+        pipeline = CoScientistPipeline(
+            llm=llm,
+            chromadb=chromadb,
+            ptm_connector=ptm_conn,
+            max_iterations=req.max_iterations,
+            generate_candidates=settings.coscientist.generate_candidates,
+            tournament_rounds=settings.coscientist.tournament_rounds,
+            evolve_top_k=settings.coscientist.evolve_top_k,
+            elo_k_factor=settings.coscientist.elo_k_factor,
+        )
+
+        # Get existing feedback if any
+        existing_state = _sessions[session_id].get("state")
+        feedback = existing_state.scientist_feedback if existing_state else []
+
+        state = pipeline.run(
+            order_code=req.order_code,
+            research_goal=req.research_goal,
+            ptm_type=req.ptm_type,
+            rag_collections=req.rag_collections,
+            scientist_feedback=feedback,
+        )
+
+        # Auto-design experiments for top hypotheses
+        designs = run_experiment_design(
+            hypotheses=state.hypotheses,
+            llm=llm,
+            experimental_context=state.experimental_context,
+            top_n=5,
+        )
+        state.experiment_designs = designs
+
+        _sessions[session_id]["state"] = state
+        _sessions[session_id]["status"] = "completed"
+
+        # Save results to file
+        _save_results(session_id, state, settings.coscientist.output_dir)
+
+    except Exception as e:
+        logger.error(f"Pipeline failed for session {session_id}: {e}", exc_info=True)
+        _sessions[session_id]["status"] = f"error: {str(e)}"
+
+
+def _create_llm(settings) -> LLMClient:
+    """Create LLM client from settings."""
+    return LLMClient(
+        provider=settings.llm.provider,
+        model=settings.llm.ollama_model,
+        ollama_url=settings.llm.ollama_url,
+        openai_api_key=settings.llm.openai_api_key,
+        openai_model=settings.llm.openai_model,
+        gemini_api_key=settings.llm.gemini_api_key,
+        gemini_model=settings.llm.gemini_model,
+    )
+
+
+def _save_results(session_id: str, state: CoScientistState, output_dir: str):
+    """Save pipeline results to JSON file."""
+    out_path = Path(output_dir) / session_id
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    results = {
+        "session_id": session_id,
+        "research_goal": state.research_goal,
+        "iteration": state.iteration,
+        "tournament_history": state.tournament_history,
+        "hypotheses": [h.to_dict() for h in state.hypotheses],
+        "experiment_designs": [e.to_dict() for e in state.experiment_designs],
+        "scientist_feedback": state.scientist_feedback,
+    }
+
+    with open(out_path / "results.json", "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"Results saved to {out_path / 'results.json'}")

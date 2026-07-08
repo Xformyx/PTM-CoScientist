@@ -17,10 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy remaining project files
+COPY webui/ webui/
 COPY . .
 
-# Expose API port
-EXPOSE 8080
+# Expose API and Streamlit ports
+EXPOSE 8080 8501
 
 # Default command: start the API server
 CMD ["coscientist", "serve"]

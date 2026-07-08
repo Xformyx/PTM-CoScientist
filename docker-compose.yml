@@ -23,3 +23,18 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+  coscientist-webui:
+    build: .
+    image: ptm-coscientist-api
+    container_name: ptm-coscientist-webui
+    command: streamlit run webui/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
+    environment:
+      - COSCIENTIST_API_URL=http://coscientist-api:8080
+    depends_on:
+      - coscientist-api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

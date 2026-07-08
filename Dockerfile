@@ -2,11 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+COPY src/ src/
+COPY config/ config/
 
-# Copy source code
+# asyncmy ships Cython extensions; on aarch64 there is no pre-built wheel,
+# so gcc is required to compile from source during pip install.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+    && pip install --no-cache-dir . \
+    && apt-get purge -y gcc g++ \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy remaining project files
 COPY . .
 
 # Expose API port

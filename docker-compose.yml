@@ -1,8 +1,7 @@
-version: '3.8'
-
 services:
   coscientist-api:
     build: .
+    image: ptm-coscientist-api
     container_name: ptm-coscientist-api
     ports:
       - "8080:8080"

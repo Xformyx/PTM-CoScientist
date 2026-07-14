@@ -107,6 +107,8 @@ class CoScientistPipeline:
                 n_candidates=self.generate_candidates,
                 research_goal=self._build_goal_with_feedback(research_goal, state.scientist_feedback, iteration),
                 iteration=iteration,
+                chromadb=self.chromadb,
+                rag_collections=rag_collections,
             )
             all_hypotheses.extend(new_hypotheses)
 
@@ -120,6 +122,7 @@ class CoScientistPipeline:
                 chromadb=self.chromadb,
                 tournament_rounds=self.tournament_rounds,
                 k_factor=self.elo_k_factor,
+                rag_collections=rag_collections,
             )
 
             if progress_callback:

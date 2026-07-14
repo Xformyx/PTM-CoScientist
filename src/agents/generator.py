@@ -8,7 +8,7 @@ structured IF-THEN-BECAUSE hypotheses.
 
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from src.core.llm_client import LLMClient
 from src.core.models import Hypothesis, HypothesisCategory, HypothesisStatus
@@ -53,6 +53,8 @@ def run_generation(
     n_candidates: int = 5,
     research_goal: str = "",
     iteration: int = 0,
+    chromadb=None,
+    rag_collections: Optional[List[str]] = None,
 ) -> List[Hypothesis]:
     """
     Generate hypothesis candidates from PTM-platform context.
@@ -63,11 +65,26 @@ def run_generation(
         n_candidates: Number of hypotheses to generate
         research_goal: User's research goal/question
         iteration: Current iteration (for diversity)
+        chromadb: Optional ChromaDBConnector for live literature enrichment
+        rag_collections: ChromaDB collection names to restrict search (None = all)
 
     Returns:
         List of Hypothesis objects
     """
-    user_prompt = _build_user_prompt(context, n_candidates, research_goal, iteration)
+    # Fetch relevant literature from ChromaDB to enrich the generation prompt
+    lit_context: List[Dict[str, Any]] = []
+    if chromadb is not None and chromadb.is_available():
+        top_genes = [p.get("gene", "") for p in context.get("top_ptms", [])[:8] if p.get("gene")]
+        ptm_type = context.get("ptm_type", "phosphorylation")
+        lit_context = chromadb.search_for_context(
+            genes=top_genes,
+            ptm_type=ptm_type,
+            collection_names=rag_collections,
+            n_results=8,
+        )
+        logger.info(f"[Generator] Fetched {len(lit_context)} literature snippets from ChromaDB")
+
+    user_prompt = _build_user_prompt(context, n_candidates, research_goal, iteration, lit_context)
 
     response = llm.generate(
         prompt=user_prompt,
@@ -81,7 +98,13 @@ def run_generation(
     return hypotheses
 
 
-def _build_user_prompt(context: Dict[str, Any], n_candidates: int, research_goal: str, iteration: int) -> str:
+def _build_user_prompt(
+    context: Dict[str, Any],
+    n_candidates: int,
+    research_goal: str,
+    iteration: int,
+    lit_context: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Build the user prompt from context."""
     parts = []
 
@@ -123,6 +146,20 @@ def _build_user_prompt(context: Dict[str, Any], n_candidates: int, research_goal
     report = context.get("comprehensive_report_excerpt", "")
     if report:
         parts.append(f"## Analysis Report Excerpt\n{report[:2000]}")
+
+    # Live literature context from ChromaDB
+    if lit_context:
+        snippets = []
+        seen_sources = set()
+        for item in lit_context:
+            source = item.get("metadata", {}).get("title", "Unknown")
+            doc = item.get("document", "")
+            if not doc or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            snippets.append(f"- [{source}] {doc[:250]}")
+        if snippets:
+            parts.append("## Relevant Literature (from ChromaDB)\n" + "\n".join(snippets[:6]))
 
     parts.append(f"\n## Task\nGenerate exactly {n_candidates} novel hypotheses.")
     if iteration > 0:

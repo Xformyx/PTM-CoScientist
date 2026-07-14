@@ -9,7 +9,7 @@ Also validates hypotheses against ChromaDB literature evidence.
 import json
 import logging
 import itertools
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 from src.core.llm_client import LLMClient
 from src.core.models import Hypothesis, HypothesisStatus
@@ -53,6 +53,7 @@ def run_debate(
     chromadb: ChromaDBConnector,
     tournament_rounds: int = 3,
     k_factor: int = 32,
+    rag_collections: Optional[List[str]] = None,
 ) -> List[Hypothesis]:
     """
     Run debate tournament on hypotheses.
@@ -67,6 +68,7 @@ def run_debate(
         chromadb: ChromaDB connector for evidence retrieval
         tournament_rounds: Number of tournament rounds
         k_factor: Elo K-factor
+        rag_collections: ChromaDB collection names to restrict search (None = all)
 
     Returns:
         Hypotheses with updated Elo ratings and debate history
@@ -77,7 +79,7 @@ def run_debate(
     # Step 1: Literature validation
     logger.info(f"[Debater] Validating {len(hypotheses)} hypotheses against literature")
     for h in hypotheses:
-        _validate_against_literature(h, chromadb, llm)
+        _validate_against_literature(h, chromadb, llm, rag_collections=rag_collections)
 
     # Step 2: Pairwise tournament
     logger.info(f"[Debater] Running {tournament_rounds} tournament rounds")
@@ -111,9 +113,14 @@ def run_debate(
     return ranked
 
 
-def _validate_against_literature(h: Hypothesis, chromadb: ChromaDBConnector, llm: LLMClient):
+def _validate_against_literature(
+    h: Hypothesis,
+    chromadb: ChromaDBConnector,
+    llm: LLMClient,
+    rag_collections: Optional[List[str]] = None,
+):
     """Validate a hypothesis against ChromaDB literature."""
-    evidence = chromadb.search_for_hypothesis(h)
+    evidence = chromadb.search_for_hypothesis(h, collection_names=rag_collections)
     if not evidence:
         return
 

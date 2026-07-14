@@ -116,7 +116,11 @@ class ChromaDBConnector:
         all_results.sort(key=lambda x: x["distance"])
         return all_results[:n_results]
 
-    def search_for_hypothesis(self, hypothesis) -> List[Dict[str, Any]]:
+    def search_for_hypothesis(
+        self,
+        hypothesis,
+        collection_names: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Targeted search for hypothesis validation (mirrors PTM-platform's RAGRetriever)."""
         queries = [
             getattr(hypothesis, "condition", ""),
@@ -126,12 +130,37 @@ class ChromaDBConnector:
         query_text = " ".join(q for q in queries if q)
         if not query_text.strip():
             return []
-        return self.search(query_text, n_results=8)
+        return self.search(query_text, collection_names=collection_names, n_results=8)
 
-    def search_for_ptm(self, gene: str, position: str, ptm_type: str = "phosphorylation") -> List[Dict[str, Any]]:
+    def search_for_ptm(
+        self,
+        gene: str,
+        position: str,
+        ptm_type: str = "phosphorylation",
+        collection_names: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Search for literature about a specific PTM site."""
         query = f"{gene} {position} {ptm_type} function signaling"
-        return self.search(query, n_results=5)
+        return self.search(query, collection_names=collection_names, n_results=5)
+
+    def search_for_context(
+        self,
+        genes: List[str],
+        ptm_type: str = "phosphorylation",
+        collection_names: Optional[List[str]] = None,
+        n_results: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Broad literature search used by Generator to enrich hypothesis prompts.
+
+        Builds a query from the top differentially modified genes and PTM type
+        to surface relevant signaling / pathway literature before generation.
+        """
+        if not genes:
+            return []
+        gene_str = " ".join(genes[:8])
+        query = f"{gene_str} {ptm_type} signaling kinase pathway regulation"
+        return self.search(query, collection_names=collection_names, n_results=n_results)
 
     @staticmethod
     def _infer_source_type(metadata: Optional[dict]) -> str:

@@ -10,7 +10,7 @@ Provides REST API for:
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -60,6 +60,50 @@ class SessionResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "ptm-coscientist"}
+
+
+@app.get("/health/detailed")
+def health_detailed() -> Dict[str, Any]:
+    """Deep health check: verifies ChromaDB connectivity and PTM artifacts directory."""
+    settings = get_settings()
+    result: Dict[str, Any] = {"status": "ok", "service": "ptm-coscientist", "checks": {}}
+
+    # ChromaDB
+    try:
+        chroma = ChromaDBConnector(settings.ptm_platform.chromadb_url)
+        available = chroma.is_available()
+        collections = chroma.list_collections() if available else []
+        result["checks"]["chromadb"] = {
+            "url": settings.ptm_platform.chromadb_url,
+            "reachable": available,
+            "collections": collections,
+            "collection_count": len(collections),
+        }
+    except Exception as e:
+        result["checks"]["chromadb"] = {"reachable": False, "error": str(e)}
+        result["status"] = "degraded"
+
+    # PTM artifacts directory
+    artifacts_dir = Path(settings.ptm_platform.artifacts_dir)
+    artifacts_ok = artifacts_dir.exists() and artifacts_dir.is_dir()
+    order_dirs = sorted([p.name for p in artifacts_dir.iterdir() if p.is_dir()])[:10] if artifacts_ok else []
+    result["checks"]["ptm_artifacts"] = {
+        "path": str(artifacts_dir),
+        "accessible": artifacts_ok,
+        "sample_orders": order_dirs,
+        "order_count": len(list(artifacts_dir.iterdir())) if artifacts_ok else 0,
+    }
+    if not artifacts_ok:
+        result["status"] = "degraded"
+
+    # Output directory
+    output_dir = Path(settings.coscientist.output_dir)
+    result["checks"]["output_dir"] = {
+        "path": str(output_dir),
+        "accessible": output_dir.exists(),
+    }
+
+    return result
 
 
 @app.post("/run")
@@ -133,6 +177,32 @@ def submit_feedback(session_id: str, req: FeedbackRequest):
         "total_feedback": len(state.scientist_feedback),
         "message": "Re-run the pipeline to incorporate feedback",
     }
+
+
+@app.post("/session/{session_id}/rerun")
+def rerun_pipeline(session_id: str, background_tasks: BackgroundTasks):
+    """
+    Re-run the pipeline for an existing session, incorporating any scientist feedback.
+
+    Reuses the original RunRequest (order_code, ptm_type, rag_collections, etc.)
+    and appends the accumulated scientist_feedback as guidance for the new run.
+    """
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _sessions[session_id]
+    if session["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline is already running")
+
+    # Restore original request
+    req_data = session.get("request", {})
+    req = RunRequest(**req_data)
+
+    # Mark as running again (preserving accumulated feedback on existing state)
+    session["status"] = "running"
+
+    background_tasks.add_task(_execute_pipeline, session_id, req)
+    return {"session_id": session_id, "status": "restarted"}
 
 
 @app.post("/session/{session_id}/design-experiments")

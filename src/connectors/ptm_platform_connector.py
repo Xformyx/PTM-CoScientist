@@ -138,6 +138,88 @@ class PTMPlatformConnector:
 
     # ─── Context assembly (combines all sources) ─────────────────────────
 
+    def assemble_multi_context(
+        self,
+        order_codes: List[str],
+        ptm_type: str = "phosphorylation",
+    ) -> Dict[str, Any]:
+        """
+        Assemble and synthesise context from multiple orders.
+
+        Merges PTM data across experiments, annotates each site with how many
+        orders it appears in, and surfaces cross-order kinase patterns.
+        """
+        if not order_codes:
+            return {}
+        if len(order_codes) == 1:
+            return self.assemble_context(order_codes[0], ptm_type)
+
+        all_ptm_maps: Dict[str, Dict[str, Any]] = {}  # key: "GENE-POS"
+        all_kinase_modules: List[Dict[str, Any]] = []
+        report_excerpts: List[str] = []
+        total_enriched = 0
+
+        for oc in order_codes:
+            enriched = self.load_enriched_ptm_data(oc, ptm_type)
+            total_enriched += len(enriched)
+
+            for ptm in enriched[:30]:
+                gene = ptm.get("gene", ptm.get("Gene.Name", ""))
+                pos = ptm.get("position", ptm.get("Position", ""))
+                key = f"{gene}-{pos}"
+                fc = float(ptm.get("ptm_relative_log2fc", 0) or 0)
+
+                if key not in all_ptm_maps:
+                    all_ptm_maps[key] = {
+                        "gene": gene,
+                        "position": pos,
+                        "ptm_type": ptm.get("ptm_type", ptm_type),
+                        "ptm_relative_log2fc": fc,
+                        "protein_log2fc": float(ptm.get("protein_log2fc", 0) or 0),
+                        "pathways": ptm.get("rag_enrichment", {}).get("pathways", [])[:3],
+                        "function_summary": ptm.get("rag_enrichment", {}).get("function_summary", ""),
+                        "regulation": ptm.get("rag_enrichment", {}).get("regulation", {}),
+                        "order_codes": [oc],
+                        "occurrence_count": 1,
+                    }
+                else:
+                    existing = all_ptm_maps[key]
+                    existing["occurrence_count"] += 1
+                    existing["order_codes"].append(oc)
+                    # Keep the highest absolute log2fc
+                    if abs(fc) > abs(existing["ptm_relative_log2fc"]):
+                        existing["ptm_relative_log2fc"] = fc
+
+            kinase = self.load_kinase_modules(oc)
+            for mod in kinase.get("kinase_modules", []):
+                all_kinase_modules.append({**mod, "order_code": oc})
+
+            report = self.load_comprehensive_report(oc, ptm_type)
+            if report:
+                report_excerpts.append(f"### Order: {oc}\n{report[:1500]}")
+
+        # Sort: first by occurrence (cross-order sites first), then by |log2fc|
+        top_ptms = sorted(
+            all_ptm_maps.values(),
+            key=lambda x: (-x["occurrence_count"], -abs(x["ptm_relative_log2fc"])),
+        )[:25]
+
+        cross_order_sites = [p for p in top_ptms if p["occurrence_count"] > 1]
+
+        return {
+            "order_codes": order_codes,
+            "order_count": len(order_codes),
+            "ptm_type": ptm_type,
+            "enriched_ptm_count": total_enriched,
+            "top_ptms": top_ptms,
+            "cross_order_sites": cross_order_sites,
+            "cross_order_site_count": len(cross_order_sites),
+            "kinase_modules": {"kinase_modules": all_kinase_modules[:20]},
+            "signal_flow": {},
+            "comovement_clusters": {},
+            "comprehensive_report_excerpt": "\n\n".join(report_excerpts)[:6000],
+        }
+
     def assemble_context(self, order_code: str, ptm_type: str = "phosphorylation") -> Dict[str, Any]:
         """
         Assemble full context from PTM-platform artifacts for Co-Scientist.

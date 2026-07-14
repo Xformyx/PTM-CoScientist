@@ -20,6 +20,9 @@ services:
       - ${PTM_PLATFORM_DATA_DIR:-../PTM-platform/data/outputs}:/data/ptm-platform/outputs:ro
       # Output directory for Co-Scientist results
       - ./data/outputs:/data/coscientist/outputs
+    networks:
+      - default
+      - ptm-platform-network
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -35,6 +38,13 @@ services:
       - COSCIENTIST_API_URL=http://coscientist-api:8080
     depends_on:
       - coscientist-api
+    networks:
+      - default
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+networks:
+  ptm-platform-network:
+    external: true
+    name: ptm-platform-network

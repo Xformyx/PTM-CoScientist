@@ -33,11 +33,20 @@ _sessions: dict = {}
 # ─── Request/Response models ─────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    order_code: str
+    order_codes: List[str] = []   # multi-order (preferred)
+    order_code: str = ""          # single-order (legacy, still supported)
     research_goal: str = ""
     ptm_type: str = "phosphorylation"
     rag_collections: Optional[List[str]] = None
     max_iterations: int = 3
+
+    @property
+    def resolved_order_codes(self) -> List[str]:
+        if self.order_codes:
+            return self.order_codes
+        if self.order_code:
+            return [self.order_code]
+        return []
 
 
 class FeedbackRequest(BaseModel):
@@ -260,7 +269,7 @@ def _execute_pipeline(session_id: str, req: RunRequest):
         feedback = existing_state.scientist_feedback if existing_state else []
 
         state = pipeline.run(
-            order_code=req.order_code,
+            order_codes=req.resolved_order_codes,
             research_goal=req.research_goal,
             ptm_type=req.ptm_type,
             rag_collections=req.rag_collections,

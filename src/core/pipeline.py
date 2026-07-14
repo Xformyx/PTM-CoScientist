@@ -50,18 +50,20 @@ class CoScientistPipeline:
 
     def run(
         self,
-        order_code: str,
+        order_code: str = "",
         research_goal: str = "",
         ptm_type: str = "phosphorylation",
         rag_collections: Optional[List[str]] = None,
         scientist_feedback: Optional[List[Dict[str, str]]] = None,
         progress_callback=None,
+        order_codes: Optional[List[str]] = None,
     ) -> CoScientistState:
         """
         Execute the full Co-Scientist pipeline.
 
         Args:
-            order_code: PTM-platform order code to load context from
+            order_code: Single PTM-platform order code (legacy, use order_codes)
+            order_codes: Multiple order codes for cross-order synthesis
             research_goal: Natural language research goal
             ptm_type: "phosphorylation" or "ubiquitylation"
             rag_collections: Specific ChromaDB collections to use
@@ -71,6 +73,9 @@ class CoScientistPipeline:
         Returns:
             CoScientistState with all hypotheses and results
         """
+        # Normalise: order_codes takes precedence; fall back to single order_code
+        codes = order_codes or ([order_code] if order_code else [])
+
         state = CoScientistState(
             research_goal=research_goal,
             rag_collections=rag_collections or [],
@@ -82,7 +87,11 @@ class CoScientistPipeline:
         if progress_callback:
             progress_callback(5, "Loading PTM-platform context")
 
-        context = self.ptm_connector.assemble_context(order_code, ptm_type)
+        context = (
+            self.ptm_connector.assemble_multi_context(codes, ptm_type)
+            if len(codes) != 1
+            else self.ptm_connector.assemble_context(codes[0], ptm_type)
+        )
         state.enriched_ptm_data = context.get("top_ptms", [])
         state.kinase_modules = context.get("kinase_modules", {})
         state.signal_flow = context.get("signal_flow", {})

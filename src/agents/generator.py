@@ -142,6 +142,24 @@ def _build_user_prompt(
     if clusters:
         parts.append(f"## Temporal Co-movement\n{json.dumps(clusters, indent=2)[:1000]}")
 
+    # Cross-order synthesis context
+    cross_sites = context.get("cross_order_sites", [])
+    order_count = context.get("order_count", 1)
+    if cross_sites and order_count > 1:
+        lines = []
+        for p in cross_sites[:10]:
+            fc = p.get("ptm_relative_log2fc", 0)
+            direction = "↑" if fc > 0 else "↓"
+            lines.append(
+                f"- {p['gene']}-{p['position']} ({direction} {abs(fc):.2f}) "
+                f"appears in {p['occurrence_count']}/{order_count} orders"
+            )
+        parts.append(
+            f"## Cross-Experiment Consensus Sites ({len(cross_sites)} sites across {order_count} orders)\n"
+            + "\n".join(lines)
+            + "\n\n*These sites are especially significant — they recur across independent experiments.*"
+        )
+
     # Report excerpt
     report = context.get("comprehensive_report_excerpt", "")
     if report:

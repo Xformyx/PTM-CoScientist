@@ -39,6 +39,9 @@ class RunRequest(BaseModel):
     ptm_type: str = "phosphorylation"
     rag_collections: Optional[List[str]] = None
     max_iterations: int = 3
+    # Per-request LLM override (empty = use server default from env)
+    llm_provider: str = ""   # "" | "auto" | "ollama" | "openai" | "gemini"
+    llm_model: str = ""      # e.g. "gemma3:27b", "gpt-4.1-mini", "gemini-2.5-flash"
 
     @property
     def resolved_order_codes(self) -> List[str]:
@@ -227,7 +230,12 @@ def design_experiments(session_id: str, top_n: int = 5):
         raise HTTPException(status_code=400, detail="No hypotheses available")
 
     settings = get_settings()
-    llm = _create_llm(settings)
+    req_data = session.get("request", {})
+    llm = _create_llm(
+        settings,
+        llm_provider=req_data.get("llm_provider", ""),
+        llm_model=req_data.get("llm_model", ""),
+    )
 
     designs = run_experiment_design(
         hypotheses=state.hypotheses,
@@ -246,7 +254,7 @@ def _execute_pipeline(session_id: str, req: RunRequest):
     """Execute the pipeline in background."""
     try:
         settings = get_settings()
-        llm = _create_llm(settings)
+        llm = _create_llm(settings, llm_provider=req.llm_provider, llm_model=req.llm_model)
         chromadb = ChromaDBConnector(settings.ptm_platform.chromadb_url)
         ptm_conn = PTMPlatformConnector(
             artifacts_dir=settings.ptm_platform.artifacts_dir,
@@ -296,16 +304,31 @@ def _execute_pipeline(session_id: str, req: RunRequest):
         _sessions[session_id]["status"] = f"error: {str(e)}"
 
 
-def _create_llm(settings) -> LLMClient:
-    """Create LLM client from settings."""
+def _create_llm(settings, llm_provider: str = "", llm_model: str = "") -> LLMClient:
+    """Create LLM client from settings, with optional per-request overrides.
+
+    llm_provider: if non-empty, overrides settings.llm.provider
+    llm_model:    if non-empty, used as the model name for the resolved provider
+    """
+    provider = llm_provider.strip() or settings.llm.provider
+
+    # Derive per-provider model overrides from llm_model
+    ollama_model  = llm_model if (llm_model and provider in ("ollama", "auto"))  else settings.llm.ollama_model
+    openai_model  = llm_model if (llm_model and provider == "openai")  else settings.llm.openai_model
+    gemini_model  = llm_model if (llm_model and provider == "gemini")  else settings.llm.gemini_model
+
+    # When provider is auto and llm_model is given, set it for all backends
+    if llm_model and provider == "auto":
+        ollama_model = openai_model = gemini_model = llm_model
+
     return LLMClient(
-        provider=settings.llm.provider,
-        model=settings.llm.ollama_model,
+        provider=provider,
+        model=ollama_model,
         ollama_url=settings.llm.ollama_url,
         openai_api_key=settings.llm.openai_api_key,
-        openai_model=settings.llm.openai_model,
+        openai_model=openai_model,
         gemini_api_key=settings.llm.gemini_api_key,
-        gemini_model=settings.llm.gemini_model,
+        gemini_model=gemini_model,
     )
 
 

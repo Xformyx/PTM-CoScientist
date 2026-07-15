@@ -57,6 +57,7 @@ class CoScientistPipeline:
         scientist_feedback: Optional[List[Dict[str, str]]] = None,
         progress_callback=None,
         order_codes: Optional[List[str]] = None,
+        cancel_check=None,
     ) -> CoScientistState:
         """
         Execute the full Co-Scientist pipeline.
@@ -104,6 +105,10 @@ class CoScientistPipeline:
         all_hypotheses: List[Hypothesis] = []
 
         for iteration in range(self.max_iterations):
+            if cancel_check and cancel_check():
+                logger.info(f"[Pipeline] Cancelled before iteration {iteration + 1}")
+                break
+
             pct_base = 10 + (iteration * 25)
 
             if progress_callback:

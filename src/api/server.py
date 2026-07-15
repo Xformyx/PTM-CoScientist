@@ -191,6 +191,20 @@ def submit_feedback(session_id: str, req: FeedbackRequest):
     }
 
 
+@app.post("/session/{session_id}/cancel")
+def cancel_pipeline(session_id: str):
+    """Request cancellation of a running Co-Scientist session."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = _sessions[session_id]
+    if session["status"] != "running":
+        return {"session_id": session_id, "status": session["status"], "message": "Not running"}
+    # Set a cancel flag; _execute_pipeline checks it each iteration
+    session["cancel_requested"] = True
+    session["status"] = "cancelling"
+    return {"session_id": session_id, "status": "cancelling"}
+
+
 @app.post("/session/{session_id}/rerun")
 def rerun_pipeline(session_id: str, background_tasks: BackgroundTasks):
     """
@@ -276,13 +290,23 @@ def _execute_pipeline(session_id: str, req: RunRequest):
         existing_state = _sessions[session_id].get("state")
         feedback = existing_state.scientist_feedback if existing_state else []
 
+        def _check_cancel() -> bool:
+            return bool(_sessions.get(session_id, {}).get("cancel_requested"))
+
         state = pipeline.run(
             order_codes=req.resolved_order_codes,
             research_goal=req.research_goal,
             ptm_type=req.ptm_type,
             rag_collections=req.rag_collections,
             scientist_feedback=feedback,
+            cancel_check=_check_cancel,
         )
+
+        if _sessions[session_id].get("cancel_requested"):
+            _sessions[session_id]["cancel_requested"] = False
+            _sessions[session_id]["status"] = "cancelled"
+            logger.info(f"Session {session_id} cancelled by user request")
+            return
 
         # Auto-design experiments for top hypotheses
         designs = run_experiment_design(

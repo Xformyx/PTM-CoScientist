@@ -9,6 +9,7 @@ Provides REST API for:
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,8 +27,59 @@ from src.agents.experiment_designer import run_experiment_design
 logger = logging.getLogger(__name__)
 app = FastAPI(title="PTM-CoScientist", version="0.1.0")
 
-# ─── In-memory state (replace with Redis/DB for production) ──────────────
-_sessions: dict = {}
+# ─── Session store — persisted to disk so restarts don't lose results ────
+_SESSION_FILE = Path(
+    "/data/coscientist/outputs/.sessions.json"
+)
+_sessions_lock = threading.Lock()
+
+
+def _sessions_path() -> Path:
+    """Return path to the session store file, ensuring parent dir exists."""
+    _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    return _SESSION_FILE
+
+
+def _load_sessions() -> dict:
+    """Load sessions from disk. Returns empty dict on missing/corrupt file."""
+    p = _sessions_path()
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text())
+        # Mark any sessions that were 'running' at shutdown as error
+        for sid, s in raw.items():
+            if s.get("status") in ("running", "cancelling"):
+                s["status"] = "error"
+                s["error"] = "서버가 재시작되어 파이프라인이 중단됐습니다."
+        return raw
+    except Exception as e:
+        logger.warning(f"[Sessions] Failed to load session file: {e}")
+        return {}
+
+
+def _save_sessions() -> None:
+    """Persist sessions (excluding unpicklable state objects) to disk."""
+    p = _sessions_path()
+    try:
+        serialisable = {}
+        for sid, s in _sessions.items():
+            entry = {k: v for k, v in s.items() if k != "state"}
+            # Persist top hypotheses so results survive restarts
+            state: Optional[CoScientistState] = s.get("state")
+            if state and state.hypotheses:
+                entry["_hypotheses"] = [h.to_dict() for h in state.hypotheses[:20]]
+                entry["_iteration"] = state.iteration
+                entry["_experiment_designs"] = [e.to_dict() for e in state.experiment_designs[:10]]
+            serialisable[sid] = entry
+        p.write_text(json.dumps(serialisable, default=str))
+    except Exception as e:
+        logger.warning(f"[Sessions] Failed to save sessions: {e}")
+
+
+# Boot: load any previous sessions
+_sessions: dict = _load_sessions()
+logger.info(f"[Sessions] Loaded {len(_sessions)} persisted session(s)")
 
 
 # ─── Request/Response models ─────────────────────────────────────────────
@@ -65,6 +117,7 @@ class SessionResponse(BaseModel):
     total_hypotheses: int
     top_hypotheses: list
     experiment_designs: list
+    error: Optional[str] = None
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────
@@ -129,6 +182,7 @@ def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
         "state": None,
         "request": req.model_dump(),
     }
+    _save_sessions()
 
     background_tasks.add_task(_execute_pipeline, session_id, req)
 
@@ -145,13 +199,15 @@ def get_session(session_id: str) -> SessionResponse:
     state: Optional[CoScientistState] = session.get("state")
 
     if state is None:
+        # Fall back to persisted hypothesis data (survives restarts)
         return SessionResponse(
             session_id=session_id,
             status=session["status"],
-            iteration=0,
-            total_hypotheses=0,
-            top_hypotheses=[],
-            experiment_designs=[],
+            iteration=session.get("_iteration", 0),
+            total_hypotheses=len(session.get("_hypotheses", [])),
+            top_hypotheses=session.get("_hypotheses", [])[:10],
+            experiment_designs=session.get("_experiment_designs", []),
+            error=session.get("error"),
         )
 
     top_hyps = [h.to_dict() for h in state.hypotheses[:10]]
@@ -202,6 +258,7 @@ def cancel_pipeline(session_id: str):
     # Set a cancel flag; _execute_pipeline checks it each iteration
     session["cancel_requested"] = True
     session["status"] = "cancelling"
+    _save_sessions()
     return {"session_id": session_id, "status": "cancelling"}
 
 
@@ -306,6 +363,8 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             _sessions[session_id]["cancel_requested"] = False
             _sessions[session_id]["status"] = "cancelled"
             logger.info(f"Session {session_id} cancelled by user request")
+            _sessions[session_id]["state"] = state  # preserve partial results
+            _save_sessions()
             return
 
         # Auto-design experiments for top hypotheses
@@ -319,6 +378,7 @@ def _execute_pipeline(session_id: str, req: RunRequest):
 
         _sessions[session_id]["state"] = state
         _sessions[session_id]["status"] = "completed"
+        _save_sessions()
 
         # Save results to file
         _save_results(session_id, state, settings.coscientist.output_dir)
@@ -326,6 +386,7 @@ def _execute_pipeline(session_id: str, req: RunRequest):
     except Exception as e:
         logger.error(f"Pipeline failed for session {session_id}: {e}", exc_info=True)
         _sessions[session_id]["status"] = f"error: {str(e)}"
+        _save_sessions()
 
 
 def _create_llm(settings, llm_provider: str = "", llm_model: str = "") -> LLMClient:

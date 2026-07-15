@@ -126,6 +126,10 @@ class CoScientistPipeline:
             )
             all_hypotheses.extend(new_hypotheses)
 
+            if cancel_check and cancel_check():
+                logger.info(f"[Pipeline] Cancelled after Generate (iteration {iteration + 1})")
+                break
+
             if progress_callback:
                 progress_callback(pct_base + 8, f"Iteration {iteration + 1}: Debating {len(all_hypotheses)} hypotheses")
 
@@ -139,6 +143,10 @@ class CoScientistPipeline:
                 rag_collections=rag_collections,
             )
 
+            if cancel_check and cancel_check():
+                logger.info(f"[Pipeline] Cancelled after Debate (iteration {iteration + 1})")
+                break
+
             if progress_callback:
                 progress_callback(pct_base + 16, f"Iteration {iteration + 1}: Evolving top hypotheses")
 
@@ -151,6 +159,10 @@ class CoScientistPipeline:
                     context=context,
                 )
                 all_hypotheses.extend(evolved)
+
+                if cancel_check and cancel_check():
+                    logger.info(f"[Pipeline] Cancelled after Evolve (iteration {iteration + 1})")
+                    break
 
             state.iteration = iteration + 1
             state.tournament_history.append({

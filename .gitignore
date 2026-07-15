@@ -25,6 +25,10 @@ htmlcov/
 # Runtime outputs (Docker volume: ./data/outputs)
 data/
 
+# Dev-deploy markers
+.last-dev-build
+.last-dev-build-commit
+
 # OS / editor
 .DS_Store
 .idea/

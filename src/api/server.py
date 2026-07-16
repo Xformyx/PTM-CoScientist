@@ -10,6 +10,7 @@ Provides REST API for:
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -181,6 +182,8 @@ def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
         "status": "running",
         "state": None,
         "request": req.model_dump(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "order_codes": req.resolved_order_codes,
     }
     _save_sessions()
 
@@ -221,6 +224,30 @@ def get_session(session_id: str) -> SessionResponse:
         top_hypotheses=top_hyps,
         experiment_designs=exp_designs,
     )
+
+
+@app.get("/sessions")
+def list_sessions(order_code: str = "", limit: int = 50):
+    """List all sessions, optionally filtered by order_code."""
+    rows = []
+    for sid, s in _sessions.items():
+        codes: List[str] = s.get("order_codes") or []
+        if order_code and order_code not in codes:
+            continue
+        state: Optional[CoScientistState] = s.get("state")
+        hyp_count = len(state.hypotheses) if state else len(s.get("_hypotheses", []))
+        rows.append({
+            "session_id": sid,
+            "status": s.get("status", "unknown"),
+            "created_at": s.get("created_at", ""),
+            "order_codes": codes,
+            "total_hypotheses": hyp_count,
+            "iteration": (state.iteration if state else s.get("_iteration", 0)),
+            "research_goal": (s.get("request") or {}).get("research_goal", ""),
+            "ptm_type": (s.get("request") or {}).get("ptm_type", ""),
+        })
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return {"sessions": rows[:limit]}
 
 
 @app.post("/session/{session_id}/feedback")

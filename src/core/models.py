@@ -4,11 +4,11 @@ Core data models for PTM-CoScientist.
 Defines the structured types flowing through the agent pipeline.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-from enum import Enum
-import uuid
 import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
 
 
 class HypothesisStatus(str, Enum):
@@ -29,22 +29,32 @@ class HypothesisCategory(str, Enum):
 
 @dataclass
 class Hypothesis:
-    """A structured scientific hypothesis with IF-THEN-BECAUSE format."""
+    """A structured scientific hypothesis with auditable evidence and lineage."""
 
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     condition: str = ""  # IF
     prediction: str = ""  # THEN
     mechanism: str = ""  # BECAUSE
     category: HypothesisCategory = HypothesisCategory.MECHANISTIC
-    supporting_ptms: List[str] = field(default_factory=list)
+    supporting_ptms: list[str] = field(default_factory=list)
     signaling_chain: str = ""  # e.g., "EGFR → SRC → VIM-S56"
     testable_prediction: str = ""
     confidence: float = 0.5
     elo_rating: int = 1500
     status: HypothesisStatus = HypothesisStatus.GENERATED
-    evidence_for: List[Dict[str, Any]] = field(default_factory=list)
-    evidence_against: List[Dict[str, Any]] = field(default_factory=list)
-    debate_history: List[Dict[str, str]] = field(default_factory=list)
+
+    # Evidence entries are normalized by Debater and retain bibliographic identifiers
+    # when supplied by the source ChromaDB collection.
+    evidence_for: list[dict[str, Any]] = field(default_factory=list)
+    evidence_against: list[dict[str, Any]] = field(default_factory=list)
+    debate_history: list[dict[str, Any]] = field(default_factory=list)
+
+    # Evolution lineage enables a report reviewer to trace an evolved claim back
+    # to the debated candidate(s) and the critique(s) it addressed.
+    parent_hypothesis_ids: list[str] = field(default_factory=list)
+    evolution_type: str = ""  # strengthened | combined | deepened | divergent
+    addressed_critiques: list[str] = field(default_factory=list)
+
     generation_round: int = 0
     created_at: float = field(default_factory=time.time)
 
@@ -64,7 +74,11 @@ class Hypothesis:
             "evidence_for": self.evidence_for,
             "evidence_against": self.evidence_against,
             "debate_history": self.debate_history,
+            "parent_hypothesis_ids": self.parent_hypothesis_ids,
+            "evolution_type": self.evolution_type,
+            "addressed_critiques": self.addressed_critiques,
             "generation_round": self.generation_round,
+            "created_at": self.created_at,
         }
 
 
@@ -77,8 +91,8 @@ class ExperimentDesign:
     title: str = ""
     objective: str = ""
     approach: str = ""  # e.g., "Western Blot", "LC-MS/MS", "Kinase Inhibitor Assay"
-    key_reagents: List[str] = field(default_factory=list)
-    controls: List[str] = field(default_factory=list)
+    key_reagents: list[str] = field(default_factory=list)
+    controls: list[str] = field(default_factory=list)
     expected_outcome: str = ""
     alternative_outcome: str = ""
     estimated_timeline: str = ""
@@ -107,22 +121,22 @@ class CoScientistState:
     """Shared state flowing through the Co-Scientist pipeline."""
 
     # Input context (from PTM-platform)
-    order_id: Optional[int] = None
+    order_id: int | None = None
     research_goal: str = ""
-    experimental_context: Dict[str, Any] = field(default_factory=dict)
-    enriched_ptm_data: List[Dict[str, Any]] = field(default_factory=list)
-    kinase_modules: Dict[str, Any] = field(default_factory=dict)
-    signal_flow: Dict[str, Any] = field(default_factory=dict)
-    comovement_clusters: Dict[str, Any] = field(default_factory=dict)
-    rag_collections: List[str] = field(default_factory=list)
+    experimental_context: dict[str, Any] = field(default_factory=dict)
+    enriched_ptm_data: list[dict[str, Any]] = field(default_factory=list)
+    kinase_modules: dict[str, Any] = field(default_factory=dict)
+    signal_flow: dict[str, Any] = field(default_factory=dict)
+    comovement_clusters: dict[str, Any] = field(default_factory=dict)
+    rag_collections: list[str] = field(default_factory=list)
 
     # Pipeline state
-    hypotheses: List[Hypothesis] = field(default_factory=list)
-    tournament_history: List[Dict[str, Any]] = field(default_factory=list)
-    experiment_designs: List[ExperimentDesign] = field(default_factory=list)
+    hypotheses: list[Hypothesis] = field(default_factory=list)
+    tournament_history: list[dict[str, Any]] = field(default_factory=list)
+    experiment_designs: list[ExperimentDesign] = field(default_factory=list)
     final_report: str = ""
 
     # Scientist-in-the-loop
-    scientist_feedback: List[Dict[str, str]] = field(default_factory=list)
+    scientist_feedback: list[dict[str, str]] = field(default_factory=list)
     iteration: int = 0
     max_iterations: int = 3

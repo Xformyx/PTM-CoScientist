@@ -4,17 +4,20 @@ Debater Agent — Critically evaluates and ranks hypotheses via tournament.
 Inspired by Google Co-Scientist's Reflection + Ranking agents.
 Performs pairwise comparisons using scientific debate, then updates Elo ratings.
 Also validates hypotheses against ChromaDB literature evidence.
+
+Evidence records now include full bibliographic identifiers (pmid, doi, authors,
+year, journal, retrieval_score) so that downstream consumers — including the
+Discussion Evidence Packet exporter — can produce traceable citations.
 """
 
+import itertools
 import json
 import logging
-import itertools
-from typing import List, Dict, Any, Optional, Tuple
 
+from src.connectors.chromadb_connector import ChromaDBConnector
+from src.core.elo import rank_hypotheses, update_ratings
 from src.core.llm_client import LLMClient
 from src.core.models import Hypothesis, HypothesisStatus
-from src.core.elo import update_ratings, rank_hypotheses
-from src.connectors.chromadb_connector import ChromaDBConnector
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +50,47 @@ Reply with ONLY one word: SUPPORTING, CONTRADICTING, or NEUTRAL
 """
 
 
+def _metadata_value(meta: dict, *keys: str) -> str:
+    """Read the first non-empty value from heterogeneous collection metadata."""
+    normalized = {str(key).lower(): value for key, value in (meta or {}).items()}
+    for key in keys:
+        value = normalized.get(key.lower())
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _extract_biblio(meta: dict, collection: str, doc_id: str, distance: float) -> dict:
+    """Extract bibliographic identifiers from heterogeneous ChromaDB metadata.
+
+    Source collections use different case conventions (for example ``PMID`` or
+    ``pubmed_id``). The output schema is stable and keeps both distance and a
+    monotonic 0–1 relevance transform for downstream auditing.
+    """
+    retrieval_distance = float(distance) if distance is not None else None
+    retrieval_score = round(1 / (1 + retrieval_distance), 4) if retrieval_distance is not None else None
+    return {
+        "evidence_id": doc_id or _metadata_value(meta, "id", "document_id", "chunk_id"),
+        "pmid": _metadata_value(meta, "pmid", "pubmed_id", "pubmedid"),
+        "doi": _metadata_value(meta, "doi"),
+        "authors": _metadata_value(meta, "authors", "author"),
+        "year": _metadata_value(meta, "year", "publication_year", "published_year"),
+        "journal": _metadata_value(meta, "journal", "source", "venue"),
+        "url": _metadata_value(meta, "url", "source_url", "link"),
+        "collection": collection,
+        "retrieval_distance": retrieval_distance,
+        "retrieval_score": retrieval_score,
+    }
+
+
 def run_debate(
-    hypotheses: List[Hypothesis],
+    hypotheses: list[Hypothesis],
     llm: LLMClient,
     chromadb: ChromaDBConnector,
     tournament_rounds: int = 3,
     k_factor: int = 32,
-    rag_collections: Optional[List[str]] = None,
-) -> List[Hypothesis]:
+    rag_collections: list[str] | None = None,
+) -> list[Hypothesis]:
     """
     Run debate tournament on hypotheses.
 
@@ -71,7 +107,7 @@ def run_debate(
         rag_collections: ChromaDB collection names to restrict search (None = all)
 
     Returns:
-        Hypotheses with updated Elo ratings and debate history
+        Hypotheses with updated Elo ratings, debate history, and full evidence records
     """
     if len(hypotheses) < 2:
         return hypotheses
@@ -90,18 +126,20 @@ def run_debate(
             h_a.elo_rating, h_b.elo_rating = update_ratings(
                 h_a.elo_rating, h_b.elo_rating, winner, k_factor
             )
-            # Store debate history
+            # Store debate history with full critique for lineage tracing
             h_a.debate_history.append({
                 "round": round_num,
                 "opponent": h_b.id,
                 "result": "win" if winner == "a" else ("loss" if winner == "b" else "draw"),
                 "critique": critique.get("critique_a", ""),
+                "reasoning": critique.get("reasoning", ""),
             })
             h_b.debate_history.append({
                 "round": round_num,
                 "opponent": h_a.id,
                 "result": "win" if winner == "b" else ("loss" if winner == "a" else "draw"),
                 "critique": critique.get("critique_b", ""),
+                "reasoning": critique.get("reasoning", ""),
             })
 
     # Update status
@@ -117,9 +155,13 @@ def _validate_against_literature(
     h: Hypothesis,
     chromadb: ChromaDBConnector,
     llm: LLMClient,
-    rag_collections: Optional[List[str]] = None,
+    rag_collections: list[str] | None = None,
 ):
-    """Validate a hypothesis against ChromaDB literature."""
+    """Validate a hypothesis against ChromaDB literature.
+
+    Evidence entries are enriched with full bibliographic identifiers so that
+    the Discussion Evidence Packet can produce traceable citations.
+    """
     evidence = chromadb.search_for_hypothesis(h, collection_names=rag_collections)
     if not evidence:
         return
@@ -129,11 +171,21 @@ def _validate_against_literature(
         if not doc:
             continue
 
+        meta = ev.get("metadata", {}) or {}
+        title = _metadata_value(meta, "title", "article_title") or "Unknown"
+        biblio = _extract_biblio(
+            meta=meta,
+            collection=ev.get("collection", ""),
+            doc_id=ev.get("id", ""),
+            distance=ev.get("distance"),
+        )
+
         classification = _classify_evidence(doc, h, llm)
         entry = {
-            "text": doc[:300],
-            "source": ev.get("metadata", {}).get("title", "Unknown"),
-            "collection": ev.get("collection", ""),
+            "title": title,
+            "excerpt": doc[:400],
+            "stance": classification,
+            **biblio,
         }
 
         if classification == "supporting":
@@ -141,7 +193,7 @@ def _validate_against_literature(
         elif classification == "contradicting":
             h.evidence_against.append(entry)
 
-    # Adjust confidence based on evidence
+    # Adjust confidence based on evidence balance
     support = len(h.evidence_for)
     contra = len(h.evidence_against)
     if support + contra > 0:
@@ -166,7 +218,7 @@ def _classify_evidence(evidence_text: str, hypothesis: Hypothesis, llm: LLMClien
     return "neutral"
 
 
-def _generate_matchups(hypotheses: List[Hypothesis]) -> List[Tuple[Hypothesis, Hypothesis]]:
+def _generate_matchups(hypotheses: list[Hypothesis]) -> list[tuple[Hypothesis, Hypothesis]]:
     """Generate pairwise matchups for the tournament."""
     if len(hypotheses) <= 6:
         # Round-robin for small sets
@@ -180,7 +232,7 @@ def _generate_matchups(hypotheses: List[Hypothesis]) -> List[Tuple[Hypothesis, H
         return pairs
 
 
-def _debate_pair(h_a: Hypothesis, h_b: Hypothesis, llm: LLMClient) -> Tuple[str, Dict]:
+def _debate_pair(h_a: Hypothesis, h_b: Hypothesis, llm: LLMClient) -> tuple[str, dict]:
     """Run a debate between two hypotheses."""
     prompt = f"""## Hypothesis A
 IF: {h_a.condition}

@@ -9,28 +9,30 @@ Provides REST API for:
 
 import json
 import logging
+import os
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from config.settings import get_settings
-from src.core.llm_client import LLMClient
-from src.core.pipeline import CoScientistPipeline
-from src.core.models import CoScientistState
+from src.agents.experiment_designer import run_experiment_design
 from src.connectors.chromadb_connector import ChromaDBConnector
 from src.connectors.ptm_platform_connector import PTMPlatformConnector
-from src.agents.experiment_designer import run_experiment_design
+from src.core.discussion_packet import build_discussion_evidence_packet
+from src.core.llm_client import LLMClient
+from src.core.models import CoScientistState
+from src.core.pipeline import CoScientistPipeline
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="PTM-CoScientist", version="0.1.0")
 
 # ─── Session store — persisted to disk so restarts don't lose results ────
 _SESSION_FILE = Path(
-    "/data/coscientist/outputs/.sessions.json"
+    os.getenv("COSCIENTIST_SESSION_FILE", "/data/coscientist/outputs/.sessions.json")
 )
 _sessions_lock = threading.Lock()
 
@@ -49,12 +51,12 @@ def _load_sessions() -> dict:
     try:
         raw = json.loads(p.read_text())
         # Mark any sessions that were 'running' at shutdown as error
-        for sid, s in raw.items():
+        for s in raw.values():
             if s.get("status") in ("running", "cancelling"):
                 s["status"] = "error"
                 s["error"] = "서버가 재시작되어 파이프라인이 중단됐습니다."
         return raw
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - corrupt or inaccessible persisted state must not stop the API
         logger.warning(f"[Sessions] Failed to load session file: {e}")
         return {}
 
@@ -67,14 +69,20 @@ def _save_sessions() -> None:
         for sid, s in _sessions.items():
             entry = {k: v for k, v in s.items() if k != "state"}
             # Persist top hypotheses so results survive restarts
-            state: Optional[CoScientistState] = s.get("state")
+            state: CoScientistState | None = s.get("state")
             if state and state.hypotheses:
                 entry["_hypotheses"] = [h.to_dict() for h in state.hypotheses[:20]]
                 entry["_iteration"] = state.iteration
                 entry["_experiment_designs"] = [e.to_dict() for e in state.experiment_designs[:10]]
+                entry["_discussion_packet"] = build_discussion_evidence_packet(
+                    state,
+                    session_id=sid,
+                    source_orders=s.get("order_codes", []),
+                    created_at=s.get("created_at"),
+                )
             serialisable[sid] = entry
         p.write_text(json.dumps(serialisable, default=str))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - persistence failures are logged without breaking active sessions
         logger.warning(f"[Sessions] Failed to save sessions: {e}")
 
 
@@ -86,18 +94,18 @@ logger.info(f"[Sessions] Loaded {len(_sessions)} persisted session(s)")
 # ─── Request/Response models ─────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    order_codes: List[str] = []   # multi-order (preferred)
+    order_codes: list[str] = []   # multi-order (preferred)
     order_code: str = ""          # single-order (legacy, still supported)
     research_goal: str = ""
     ptm_type: str = "phosphorylation"
-    rag_collections: Optional[List[str]] = None
+    rag_collections: list[str] | None = None
     max_iterations: int = 3
     # Per-request LLM override (empty = use server default from env)
     llm_provider: str = ""   # "" | "auto" | "ollama" | "openai" | "gemini"
     llm_model: str = ""      # e.g. "gemma3:27b", "gpt-4.1-mini", "gemini-2.5-flash"
 
     @property
-    def resolved_order_codes(self) -> List[str]:
+    def resolved_order_codes(self) -> list[str]:
         if self.order_codes:
             return self.order_codes
         if self.order_code:
@@ -118,7 +126,7 @@ class SessionResponse(BaseModel):
     total_hypotheses: int
     top_hypotheses: list
     experiment_designs: list
-    error: Optional[str] = None
+    error: str | None = None
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────
@@ -129,10 +137,10 @@ def health():
 
 
 @app.get("/health/detailed")
-def health_detailed() -> Dict[str, Any]:
+def health_detailed() -> dict[str, Any]:
     """Deep health check: verifies ChromaDB connectivity and PTM artifacts directory."""
     settings = get_settings()
-    result: Dict[str, Any] = {"status": "ok", "service": "ptm-coscientist", "checks": {}}
+    result: dict[str, Any] = {"status": "ok", "service": "ptm-coscientist", "checks": {}}
 
     # ChromaDB
     try:
@@ -145,7 +153,7 @@ def health_detailed() -> Dict[str, Any]:
             "collections": collections,
             "collection_count": len(collections),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - health checks must report connector failures, not raise them
         result["checks"]["chromadb"] = {"reachable": False, "error": str(e)}
         result["status"] = "degraded"
 
@@ -182,7 +190,7 @@ def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
         "status": "running",
         "state": None,
         "request": req.model_dump(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "order_codes": req.resolved_order_codes,
     }
     _save_sessions()
@@ -199,7 +207,7 @@ def get_session(session_id: str) -> SessionResponse:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = _sessions[session_id]
-    state: Optional[CoScientistState] = session.get("state")
+    state: CoScientistState | None = session.get("state")
 
     if state is None:
         # Fall back to persisted hypothesis data (survives restarts)
@@ -226,15 +234,48 @@ def get_session(session_id: str) -> SessionResponse:
     )
 
 
+@app.get("/session/{session_id}/discussion-packet")
+def get_discussion_packet(session_id: str, max_hypotheses: int = 3) -> dict[str, Any]:
+    """Return an evidence-gated, report-safe Discussion Evidence Packet.
+
+    This endpoint intentionally returns interpretive candidates, not final report
+    prose. PTM-platform should cite and render the packet under its own report
+    rules after verifying the listed identifiers against its literature store.
+    """
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _sessions[session_id]
+    state: CoScientistState | None = session.get("state")
+    max_hypotheses = max(1, min(max_hypotheses, 5))
+
+    if state is not None:
+        packet = build_discussion_evidence_packet(
+            state,
+            session_id=session_id,
+            source_orders=session.get("order_codes", []),
+            created_at=session.get("created_at"),
+            max_hypotheses=max_hypotheses,
+        )
+        session["_discussion_packet"] = packet
+        _save_sessions()
+        return packet
+
+    packet = session.get("_discussion_packet")
+    if packet:
+        return packet
+    raise HTTPException(status_code=409, detail="No completed Co-Scientist result is available")
+
+
 @app.get("/sessions")
 def list_sessions(order_code: str = "", limit: int = 50):
     """List all sessions, optionally filtered by order_code."""
     rows = []
     for sid, s in _sessions.items():
-        codes: List[str] = s.get("order_codes") or []
+        codes: list[str] = s.get("order_codes") or []
         if order_code and order_code not in codes:
             continue
-        state: Optional[CoScientistState] = s.get("state")
+        state: CoScientistState | None = s.get("state")
         hyp_count = len(state.hypotheses) if state else len(s.get("_hypotheses", []))
         rows.append({
             "session_id": sid,
@@ -257,7 +298,7 @@ def submit_feedback(session_id: str, req: FeedbackRequest):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = _sessions[session_id]
-    state: Optional[CoScientistState] = session.get("state")
+    state: CoScientistState | None = session.get("state")
 
     if state is None:
         raise HTTPException(status_code=400, detail="Pipeline hasn't completed yet")
@@ -322,7 +363,7 @@ def design_experiments(session_id: str, top_n: int = 5):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = _sessions[session_id]
-    state: Optional[CoScientistState] = session.get("state")
+    state: CoScientistState | None = session.get("state")
 
     if state is None or not state.hypotheses:
         raise HTTPException(status_code=400, detail="No hypotheses available")
@@ -405,14 +446,21 @@ def _execute_pipeline(session_id: str, req: RunRequest):
 
         _sessions[session_id]["state"] = state
         _sessions[session_id]["status"] = "completed"
+        discussion_packet = build_discussion_evidence_packet(
+            state,
+            session_id=session_id,
+            source_orders=_sessions[session_id].get("order_codes", []),
+            created_at=_sessions[session_id].get("created_at"),
+        )
+        _sessions[session_id]["_discussion_packet"] = discussion_packet
         _save_sessions()
 
-        # Save results to file
-        _save_results(session_id, state, settings.coscientist.output_dir)
+        # Save full operational results plus the report-safe evidence packet.
+        _save_results(session_id, state, settings.coscientist.output_dir, discussion_packet)
 
     except Exception as e:
-        logger.error(f"Pipeline failed for session {session_id}: {e}", exc_info=True)
-        _sessions[session_id]["status"] = f"error: {str(e)}"
+        logger.exception("Pipeline failed for session %s", session_id)
+        _sessions[session_id]["status"] = f"error: {e!s}"
         _save_sessions()
 
 
@@ -444,8 +492,13 @@ def _create_llm(settings, llm_provider: str = "", llm_model: str = "") -> LLMCli
     )
 
 
-def _save_results(session_id: str, state: CoScientistState, output_dir: str):
-    """Save pipeline results to JSON file."""
+def _save_results(
+    session_id: str,
+    state: CoScientistState,
+    output_dir: str,
+    discussion_packet: dict[str, Any] | None = None,
+):
+    """Save operational results and an optional report-safe evidence packet to JSON."""
     out_path = Path(output_dir) / session_id
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -457,6 +510,7 @@ def _save_results(session_id: str, state: CoScientistState, output_dir: str):
         "hypotheses": [h.to_dict() for h in state.hypotheses],
         "experiment_designs": [e.to_dict() for e in state.experiment_designs],
         "scientist_feedback": state.scientist_feedback,
+        "discussion_evidence_packet": discussion_packet,
     }
 
     with open(out_path / "results.json", "w") as f:

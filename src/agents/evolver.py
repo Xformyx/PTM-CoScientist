@@ -3,12 +3,12 @@ Evolver Agent — Refines and combines top-ranked hypotheses.
 
 Inspired by Google Co-Scientist's Evolution agent.
 Takes the highest-Elo hypotheses, addresses their weaknesses
-(from debate critiques), and produces improved versions.
+(from debate critiques), and produces improved versions with explicit lineage.
 """
 
 import json
 import logging
-from typing import List, Dict, Any
+from typing import Any
 
 from src.core.llm_client import LLMClient
 from src.core.models import Hypothesis, HypothesisCategory, HypothesisStatus
@@ -29,8 +29,9 @@ Your task: EVOLVE these hypotheses by:
 ## RULES
 - Each evolved hypothesis must be MORE specific than its parent
 - Include concrete PTM sites and signaling chains
-- Address at least one critique from the debate
+- Address at least one critique from the debate unless evolution_type is divergent
 - Maintain testability — every hypothesis needs a clear experimental prediction
+- `parent_ids` MUST contain only IDs present in the input hypotheses
 
 ## OUTPUT FORMAT
 Return ONLY a valid JSON array:
@@ -44,30 +45,20 @@ Return ONLY a valid JSON array:
     "signaling_chain": "RECEPTOR → KINASE → SUBSTRATE",
     "testable_prediction": "...",
     "evolution_type": "strengthened | combined | deepened | divergent",
-    "parent_ids": ["id1", "id2"]
+    "parent_ids": ["id1", "id2"],
+    "addressed_critiques": ["Specific critique addressed by this evolution"]
   }
 ]
 """
 
 
 def run_evolution(
-    hypotheses: List[Hypothesis],
+    hypotheses: list[Hypothesis],
     llm: LLMClient,
     top_k: int = 3,
-    context: Dict[str, Any] = None,
-) -> List[Hypothesis]:
-    """
-    Evolve top-ranked hypotheses into improved versions.
-
-    Args:
-        hypotheses: Ranked hypotheses (from debater)
-        llm: LLM client
-        top_k: Number of top hypotheses to evolve from
-        context: Additional context from PTM-platform
-
-    Returns:
-        New evolved hypotheses
-    """
+    context: dict[str, Any] | None = None,
+) -> list[Hypothesis]:
+    """Evolve top-ranked hypotheses into improved versions with traceable lineage."""
     if not hypotheses:
         return []
 
@@ -86,13 +77,11 @@ def run_evolution(
     return evolved
 
 
-def _build_evolution_prompt(top_hypotheses: List[Hypothesis], context: Dict[str, Any] = None) -> str:
+def _build_evolution_prompt(top_hypotheses: list[Hypothesis], context: dict[str, Any] | None = None) -> str:
     """Build prompt for evolution."""
-    parts = []
-
-    parts.append("## Top-Ranked Hypotheses (from debate tournament)\n")
+    parts = ["## Top-Ranked Hypotheses (from debate tournament)\n"]
     for i, h in enumerate(top_hypotheses):
-        parts.append(f"### Hypothesis {i+1} (Elo: {h.elo_rating}, ID: {h.id})")
+        parts.append(f"### Hypothesis {i + 1} (Elo: {h.elo_rating}, ID: {h.id})")
         parts.append(f"- IF: {h.condition}")
         parts.append(f"- THEN: {h.prediction}")
         parts.append(f"- BECAUSE: {h.mechanism}")
@@ -101,13 +90,11 @@ def _build_evolution_prompt(top_hypotheses: List[Hypothesis], context: Dict[str,
         parts.append(f"- Confidence: {h.confidence}")
         parts.append(f"- Literature support: {len(h.evidence_for)} papers")
 
-        # Include debate critiques
         critiques = [d.get("critique", "") for d in h.debate_history if d.get("critique")]
         if critiques:
             parts.append(f"- **Critiques to address:** {'; '.join(critiques[:3])}")
         parts.append("")
 
-    # Additional context
     if context:
         kinase = context.get("kinase_modules", {})
         if kinase:
@@ -120,12 +107,12 @@ def _build_evolution_prompt(top_hypotheses: List[Hypothesis], context: Dict[str,
     return "\n".join(parts)
 
 
-def _parse_response(response: str, parents: List[Hypothesis]) -> List[Hypothesis]:
-    """Parse evolved hypotheses from LLM response."""
+def _parse_response(response: str, parents: list[Hypothesis]) -> list[Hypothesis]:
+    """Parse evolved hypotheses and retain model-declared, validated lineage."""
     text = response.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [line for line in lines if not line.strip().startswith("```")]
         text = "\n".join(lines)
 
     start = text.find("[")
@@ -141,9 +128,15 @@ def _parse_response(response: str, parents: List[Hypothesis]) -> List[Hypothesis
         return []
 
     hypotheses = []
-    parent_ids = [p.id for p in parents]
-    # Inherit best parent's Elo as starting point
-    best_elo = max(p.elo_rating for p in parents) if parents else 1500
+    valid_parent_ids = {parent.id for parent in parents}
+    all_parent_ids = [parent.id for parent in parents]
+    best_elo = max(parent.elo_rating for parent in parents) if parents else 1500
+    parent_critiques = {
+        critique
+        for parent in parents
+        for entry in parent.debate_history
+        if (critique := entry.get("critique", ""))
+    }
 
     for item in items:
         if not isinstance(item, dict):
@@ -155,7 +148,28 @@ def _parse_response(response: str, parents: List[Hypothesis]) -> List[Hypothesis
         except ValueError:
             category = HypothesisCategory.INTEGRATIVE
 
-        h = Hypothesis(
+        evolution_type = str(item.get("evolution_type", "strengthened")).lower()
+        if evolution_type not in {"strengthened", "combined", "deepened", "divergent"}:
+            evolution_type = "strengthened"
+
+        requested_parent_ids = item.get("parent_ids", [])
+        if not isinstance(requested_parent_ids, list):
+            requested_parent_ids = []
+        parent_ids = [parent_id for parent_id in requested_parent_ids if parent_id in valid_parent_ids]
+        if not parent_ids and evolution_type != "divergent":
+            parent_ids = all_parent_ids
+
+        requested_critiques = item.get("addressed_critiques", [])
+        if not isinstance(requested_critiques, list):
+            requested_critiques = []
+        addressed_critiques = [
+            critique for critique in requested_critiques
+            if isinstance(critique, str) and critique.strip()
+        ]
+        if not addressed_critiques and evolution_type != "divergent":
+            addressed_critiques = list(parent_critiques)[:3]
+
+        hypothesis = Hypothesis(
             condition=item.get("condition", ""),
             prediction=item.get("prediction", ""),
             mechanism=item.get("mechanism", ""),
@@ -163,13 +177,16 @@ def _parse_response(response: str, parents: List[Hypothesis]) -> List[Hypothesis
             supporting_ptms=item.get("supporting_ptms", []),
             signaling_chain=item.get("signaling_chain", ""),
             testable_prediction=item.get("testable_prediction", ""),
-            confidence=0.6,  # Evolved hypotheses start with slightly higher confidence
-            elo_rating=best_elo,  # Inherit best parent's Elo
+            confidence=0.6,
+            elo_rating=best_elo,
             status=HypothesisStatus.EVOLVED,
-            generation_round=max(p.generation_round for p in parents) + 1,
+            parent_hypothesis_ids=parent_ids,
+            evolution_type=evolution_type,
+            addressed_critiques=addressed_critiques,
+            generation_round=max(parent.generation_round for parent in parents) + 1,
         )
 
-        if h.condition and h.prediction:
-            hypotheses.append(h)
+        if hypothesis.condition and hypothesis.prediction:
+            hypotheses.append(hypothesis)
 
     return hypotheses

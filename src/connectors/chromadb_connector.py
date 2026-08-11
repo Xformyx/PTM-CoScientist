@@ -6,7 +6,7 @@ to retrieve literature evidence for hypothesis generation and validation.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -19,7 +19,7 @@ class ChromaDBConnector:
 
     def __init__(self, chromadb_url: str = "http://localhost:8000"):
         self._url = chromadb_url
-        self._client: Optional[chromadb.HttpClient] = None
+        self._client: chromadb.HttpClient | None = None
 
     @property
     def client(self) -> chromadb.HttpClient:
@@ -46,36 +46,26 @@ class ChromaDBConnector:
         try:
             self.client.heartbeat()
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - connector availability failures are expected at runtime
             logger.warning(f"ChromaDB not available: {e}")
             return False
 
-    def list_collections(self) -> List[str]:
+    def list_collections(self) -> list[str]:
         """List all available collection names."""
         try:
             collections = self.client.list_collections()
             return [c.name for c in collections]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - a failed remote listing should degrade gracefully
             logger.error(f"Failed to list collections: {e}")
             return []
 
     def search(
         self,
         query: str,
-        collection_names: Optional[List[str]] = None,
+        collection_names: list[str] | None = None,
         n_results: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """
-        Search across one or more collections.
-
-        Args:
-            query: Search query text
-            collection_names: Specific collections to search (None = all)
-            n_results: Max results per collection
-
-        Returns:
-            List of result dicts with document, metadata, distance
-        """
+    ) -> list[dict[str, Any]]:
+        """Search selected collections and return ranked, citation-preserving records."""
         if not self.is_available():
             return []
 
@@ -100,27 +90,29 @@ class ChromaDBConnector:
                 docs = results.get("documents", [[]])[0]
                 metas = results.get("metadatas", [[]])[0]
                 dists = results.get("distances", [[]])[0]
+                ids = results.get("ids", [[]])[0]
 
-                for doc, meta, dist in zip(docs, metas, dists):
+                for index, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
                     all_results.append({
+                        "id": ids[index] if index < len(ids) else "",
                         "document": doc,
                         "metadata": meta or {},
                         "distance": dist,
                         "collection": coll_name,
                         "source_type": self._infer_source_type(meta),
                     })
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one bad collection must not prevent other read-only searches
                 logger.error(f"Error querying collection {coll_name}: {e}")
 
-        # Sort by distance (lower = more relevant)
+        # ChromaDB cosine/L2 distance is lower for closer matches.
         all_results.sort(key=lambda x: x["distance"])
         return all_results[:n_results]
 
     def search_for_hypothesis(
         self,
         hypothesis,
-        collection_names: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        collection_names: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Targeted search for hypothesis validation (mirrors PTM-platform's RAGRetriever)."""
         queries = [
             getattr(hypothesis, "condition", ""),
@@ -137,25 +129,20 @@ class ChromaDBConnector:
         gene: str,
         position: str,
         ptm_type: str = "phosphorylation",
-        collection_names: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        collection_names: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Search for literature about a specific PTM site."""
         query = f"{gene} {position} {ptm_type} function signaling"
         return self.search(query, collection_names=collection_names, n_results=5)
 
     def search_for_context(
         self,
-        genes: List[str],
+        genes: list[str],
         ptm_type: str = "phosphorylation",
-        collection_names: Optional[List[str]] = None,
+        collection_names: list[str] | None = None,
         n_results: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """
-        Broad literature search used by Generator to enrich hypothesis prompts.
-
-        Builds a query from the top differentially modified genes and PTM type
-        to surface relevant signaling / pathway literature before generation.
-        """
+    ) -> list[dict[str, Any]]:
+        """Retrieve broad PTM/pathway context for hypothesis generation."""
         if not genes:
             return []
         gene_str = " ".join(genes[:8])
@@ -163,7 +150,7 @@ class ChromaDBConnector:
         return self.search(query, collection_names=collection_names, n_results=n_results)
 
     @staticmethod
-    def _infer_source_type(metadata: Optional[dict]) -> str:
+    def _infer_source_type(metadata: dict | None) -> str:
         """Infer source type from metadata (textbook, review, research)."""
         if not metadata:
             return "unknown"

@@ -84,3 +84,68 @@ export PTM_PLATFORM_DATA_DIR=/path/to/PTM-platform/data/outputs
 
 docker-compose up -d
 ```
+
+## Discussion Evidence Packet
+
+PTM-CoScientist는 PTM-platform의 최종 리포트 **Discussion**을 보강하기 위한 구조화된 `Discussion Evidence Packet`을 제공합니다. 이 패킷은 결과를 직접 서술하는 리포트 초안이 아닙니다. 대신 측정 데이터와 연결된 가설 후보, 문헌 근거·반박 근거, Debate에서 확인된 제한점, 가설 lineage, 그리고 향후 검증 실험을 전달하는 **읽기 전용 인터페이스 계약**입니다.
+
+### API
+
+완료된 세션의 패킷은 다음 엔드포인트로 조회합니다.
+
+```bash
+curl "http://localhost:8080/session/<SESSION_ID>/discussion-packet?max_hypotheses=3"
+```
+
+세션 완료 시의 `results.json`에도 동일한 객체가 `discussion_evidence_packet` 필드로 저장됩니다. 서버 재시작 뒤에도 세션 저장소에 보관된 패킷을 조회할 수 있습니다.
+
+### 품질 게이트
+
+패킷은 모든 가설을 전달하지 않습니다. 아래 조건을 모두 만족한 후보만 `selected_hypotheses`에 포함됩니다.
+
+| 필수 조건 | 목적 |
+|---|---|
+| `IF → THEN → BECAUSE` 구조 | 반증 가능한 해석 후보를 유지합니다. |
+| 실제 측정 PTM site와의 연결 | 가설이 PTM-platform 산출 데이터에 기반하도록 제한합니다. |
+| 제목 및 PMID·DOI·ChromaDB document ID 중 하나를 가진 지지 문헌 | PTM-platform의 인용 처리에서 재검증할 수 있는 근거를 보장합니다. |
+| 반박 문헌 또는 Debate critique | Discussion에 불확실성과 대안 설명을 포함하도록 강제합니다. |
+
+Elo 점수는 내부 토너먼트의 **상대적 후보 우선순위**일 뿐, 생물학적 진실도·통계적 유의성·실험 검증의 점수가 아닙니다. 따라서 패킷은 Elo 숫자를 노출하지 않고 `high`, `medium`, `exploratory` 우선순위로만 변환합니다.
+
+### PTM-platform 통합 규칙
+
+PTM-platform은 `rq_refinement` 이후 `write_sections` 이전에 CoScientist 세션을 요청하거나, 보고서 완료 후 addendum을 생성할 수 있습니다. 초기 배포에서는 후자의 비동기 addendum 방식을 권장합니다. 기본 리포트 경로는 CoScientist 호출 실패·타임아웃·빈 패킷에도 영향을 받지 않아야 합니다.
+
+Discussion Writer가 패킷을 사용할 때에는 다음 원칙을 지켜야 합니다.
+
+1. **Results의 정량값과 Figure 해석은 PTM-platform 분석 결과만으로 작성합니다.**
+2. 패킷의 가설은 `suggests`, `may`, `is consistent with`, `warrants testing` 등의 가설 언어로만 서술합니다.
+3. `literature_evidence`의 PMID/DOI/document ID를 PTM-platform의 문헌 저장소에서 다시 확인하고, 기존 citation formatter로 번호를 부여합니다.
+4. `counter_evidence`와 `limitations`를 함께 반영하여 단정적 기전 서술을 금지합니다.
+5. `experiment_priorities`는 “Limitations and Future Directions”에만 사용하며, 현재 결과를 뒷받침하는 증거로 취급하지 않습니다.
+
+### Packet 예시
+
+```json
+{
+  "schema_version": "1.0",
+  "packet_type": "discussion_evidence_packet",
+  "status": "ready",
+  "selected_hypotheses": [
+    {
+      "id": "h-001",
+      "priority_tier": "high",
+      "claim": "IF … THEN … BECAUSE …",
+      "supporting_ptm_sites": ["GENE-S123"],
+      "data_support": [{"source": "PTM-platform measured data"}],
+      "literature_evidence": [{"pmid": "…", "doi": "…", "stance": "supporting"}],
+      "counter_evidence": [],
+      "limitations": ["…"],
+      "testable_prediction": "…",
+      "lineage": {"parent_hypothesis_ids": [], "addressed_critiques": []}
+    }
+  ]
+}
+```
+
+See `tests/test_discussion_packet.py` for executable packet and quality-gate examples.

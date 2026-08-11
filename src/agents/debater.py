@@ -112,10 +112,15 @@ def run_debate(
     if len(hypotheses) < 2:
         return hypotheses
 
-    # Step 1: Literature validation
-    logger.info(f"[Debater] Validating {len(hypotheses)} hypotheses against literature")
-    for h in hypotheses:
-        _validate_against_literature(h, chromadb, llm, rag_collections=rag_collections)
+    # Step 1: Literature validation for candidates that still lack retrieved evidence.
+    # Reflection may already have attached literature earlier in the loop.
+    attach_literature_evidence(
+        hypotheses,
+        chromadb,
+        llm,
+        rag_collections=rag_collections,
+        only_missing=True,
+    )
 
     # Step 2: Pairwise tournament
     logger.info(f"[Debater] Running {tournament_rounds} tournament rounds")
@@ -149,6 +154,33 @@ def run_debate(
     ranked = rank_hypotheses(hypotheses)
     logger.info(f"[Debater] Tournament complete. Top Elo: {ranked[0].elo_rating}")
     return ranked
+
+
+def attach_literature_evidence(
+    hypotheses: list[Hypothesis],
+    chromadb: ChromaDBConnector,
+    llm: LLMClient,
+    rag_collections: list[str] | None = None,
+    *,
+    only_missing: bool = True,
+) -> list[Hypothesis]:
+    """Attach ChromaDB literature before Reflection and/or Debate.
+
+    When ``only_missing`` is True, hypotheses that already carry supporting or
+    contradicting evidence are left unchanged so Reflection and Debate can share
+    one retrieval pass without duplicating citations.
+    """
+    pending = [
+        hypothesis
+        for hypothesis in hypotheses
+        if not only_missing or (not hypothesis.evidence_for and not hypothesis.evidence_against)
+    ]
+    if not pending:
+        return hypotheses
+    logger.info("[Debater] Attaching literature evidence for %d hypotheses", len(pending))
+    for hypothesis in pending:
+        _validate_against_literature(hypothesis, chromadb, llm, rag_collections=rag_collections)
+    return hypotheses
 
 
 def _validate_against_literature(

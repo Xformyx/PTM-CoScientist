@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from src.agents.debater import run_debate
+from src.agents.debater import attach_literature_evidence, run_debate
 from src.agents.evolver import run_evolution
 from src.agents.generator import run_generation
 from src.agents.proximity import cluster_and_select_diverse_hypotheses
@@ -125,6 +125,20 @@ class CoScientistPipeline:
                 logger.info("[Pipeline] Cancelled after Generate (iteration %d)", iteration + 1)
                 break
 
+            if self.evidence_graph_enabled:
+                state.evidence_graph = build_evidence_graph(context, all_hypotheses, state.lab_results)
+
+            # Retrieve literature before Reflection so literature_consistency and
+            # evidence gaps are grounded in ChromaDB results, not an empty slate.
+            if progress_callback:
+                progress_callback(pct_base + 3, f"Iteration {iteration + 1}: Retrieving literature")
+            all_hypotheses = attach_literature_evidence(
+                all_hypotheses,
+                self.chromadb,
+                self.llm,
+                rag_collections=rag_collections,
+                only_missing=True,
+            )
             if self.evidence_graph_enabled:
                 state.evidence_graph = build_evidence_graph(context, all_hypotheses, state.lab_results)
 

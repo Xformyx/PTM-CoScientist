@@ -89,6 +89,7 @@ def test_meta_review_returns_normalised_auditable_summary():
 
 def test_lab_result_api_records_evidence_and_updates_graph(monkeypatch):
     monkeypatch.setattr(server, "_save_sessions", lambda: None)
+    monkeypatch.setattr(server, "_save_results", lambda *args, **kwargs: None)
     server._sessions.clear()
     state = _state()
     server._sessions["lab-session"] = {
@@ -115,6 +116,7 @@ def test_lab_result_api_records_evidence_and_updates_graph(monkeypatch):
 
 def test_lab_result_api_rejects_unknown_hypothesis(monkeypatch):
     monkeypatch.setattr(server, "_save_sessions", lambda: None)
+    monkeypatch.setattr(server, "_save_results", lambda *args, **kwargs: None)
     server._sessions.clear()
     server._sessions["lab-session"] = {"status": "completed", "state": _state()}
     client = TestClient(server.app)
@@ -136,3 +138,55 @@ def test_scientific_reasoning_endpoint_returns_reflection_and_lab_provenance(mon
     body = response.json()
     assert body["hypothesis_reflections"][0]["hypothesis_id"] == "hyp-01"
     assert "evidence_graph" in body
+
+
+def test_scientific_reasoning_restores_state_from_session_metadata(monkeypatch):
+    monkeypatch.setattr(server, "_save_sessions", lambda: None)
+    monkeypatch.setattr(server, "_restore_state_from_results", lambda _session_id: None)
+    server._sessions.clear()
+    state = _state()
+    state.evidence_graph = {"summary": {"node_count": 2}, "nodes": [], "edges": []}
+    state.meta_review = {"executive_summary": "Needs validation."}
+    server._sessions["restored-session"] = {
+        "status": "completed",
+        "state": None,
+        "request": {"research_goal": "Assess EGFR-SRC signalling", "ptm_type": "phosphorylation"},
+        **server._compact_state_fields(state, "restored-session", {"order_codes": ["ORDER_001"]}),
+    }
+    client = TestClient(server.app)
+    response = client.get("/session/restored-session/scientific-reasoning")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["meta_review"]["executive_summary"] == "Needs validation."
+    assert body["hypothesis_reflections"][0]["hypothesis_id"] == "hyp-01"
+    assert server._sessions["restored-session"]["state"] is not None
+
+
+def test_lab_results_restores_state_then_appends(monkeypatch):
+    monkeypatch.setattr(server, "_save_sessions", lambda: None)
+    monkeypatch.setattr(server, "_save_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_restore_state_from_results", lambda _session_id: None)
+    server._sessions.clear()
+    state = _state()
+    server._sessions["restored-lab"] = {
+        "status": "completed",
+        "state": None,
+        "order_codes": ["ORDER_001"],
+        "request": {"research_goal": "Assess EGFR-SRC signalling", "ptm_type": "phosphorylation"},
+        **server._compact_state_fields(state, "restored-lab", {"order_codes": ["ORDER_001"]}),
+    }
+    client = TestClient(server.app)
+    response = client.post(
+        "/session/restored-lab/lab-results",
+        json={
+            "hypothesis_id": "hyp-01",
+            "outcome": "inconclusive",
+            "assay_type": "Western Blot",
+            "result_summary": "Signal unchanged.",
+        },
+    )
+    assert response.status_code == 200
+    restored = server._sessions["restored-lab"]["state"]
+    assert restored is not None
+    assert len(restored.lab_results) == 1
+    assert restored.lab_results[0].outcome == "inconclusive"

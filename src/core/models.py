@@ -88,6 +88,44 @@ class Hypothesis:
             "created_at": self.created_at,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Hypothesis":
+        """Rehydrate a hypothesis from persisted JSON without inventing new fields."""
+        payload = data or {}
+        category_raw = str(payload.get("category") or HypothesisCategory.MECHANISTIC.value)
+        status_raw = str(payload.get("status") or HypothesisStatus.GENERATED.value)
+        try:
+            category = HypothesisCategory(category_raw)
+        except ValueError:
+            category = HypothesisCategory.MECHANISTIC
+        try:
+            status = HypothesisStatus(status_raw)
+        except ValueError:
+            status = HypothesisStatus.GENERATED
+        return cls(
+            id=str(payload["id"]) if payload.get("id") else str(uuid.uuid4())[:8],
+            condition=str(payload.get("condition") or ""),
+            prediction=str(payload.get("prediction") or ""),
+            mechanism=str(payload.get("mechanism") or ""),
+            category=category,
+            supporting_ptms=list(payload.get("supporting_ptms") or []),
+            signaling_chain=str(payload.get("signaling_chain") or ""),
+            testable_prediction=str(payload.get("testable_prediction") or ""),
+            confidence=float(payload.get("confidence", 0.5) or 0.5),
+            elo_rating=int(payload.get("elo_rating", 1500) or 1500),
+            status=status,
+            evidence_for=list(payload.get("evidence_for") or []),
+            evidence_against=list(payload.get("evidence_against") or []),
+            debate_history=list(payload.get("debate_history") or []),
+            reflection=dict(payload.get("reflection") or {}),
+            proximity_cluster=str(payload.get("proximity_cluster") or ""),
+            parent_hypothesis_ids=list(payload.get("parent_hypothesis_ids") or []),
+            evolution_type=str(payload.get("evolution_type") or ""),
+            addressed_critiques=list(payload.get("addressed_critiques") or []),
+            generation_round=int(payload.get("generation_round", 0) or 0),
+            created_at=float(payload.get("created_at") or time.time()),
+        )
+
 
 @dataclass
 class ExperimentDesign:
@@ -122,6 +160,24 @@ class ExperimentDesign:
             "rationale": self.rationale,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExperimentDesign":
+        payload = data or {}
+        return cls(
+            id=str(payload["id"]) if payload.get("id") else str(uuid.uuid4())[:8],
+            hypothesis_id=str(payload.get("hypothesis_id") or ""),
+            title=str(payload.get("title") or ""),
+            objective=str(payload.get("objective") or ""),
+            approach=str(payload.get("approach") or ""),
+            key_reagents=list(payload.get("key_reagents") or []),
+            controls=list(payload.get("controls") or []),
+            expected_outcome=str(payload.get("expected_outcome") or ""),
+            alternative_outcome=str(payload.get("alternative_outcome") or ""),
+            estimated_timeline=str(payload.get("estimated_timeline") or ""),
+            priority=str(payload.get("priority") or "medium"),
+            rationale=str(payload.get("rationale") or ""),
+        )
+
 
 @dataclass
 class LabResult:
@@ -154,6 +210,24 @@ class LabResult:
             "recorded_at": self.recorded_at,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LabResult":
+        payload = data or {}
+        outcome = str(payload.get("outcome") or "inconclusive")
+        if outcome not in {"supports", "contradicts", "inconclusive"}:
+            outcome = "inconclusive"
+        return cls(
+            id=str(payload["id"]) if payload.get("id") else str(uuid.uuid4())[:8],
+            hypothesis_id=str(payload.get("hypothesis_id") or ""),
+            outcome=outcome,
+            assay_type=str(payload.get("assay_type") or ""),
+            result_summary=str(payload.get("result_summary") or ""),
+            observed_effect=str(payload.get("observed_effect") or ""),
+            controls=list(payload.get("controls") or []),
+            source_reference=str(payload.get("source_reference") or ""),
+            recorded_at=float(payload.get("recorded_at") or time.time()),
+        )
+
 
 @dataclass
 class CoScientistState:
@@ -183,3 +257,69 @@ class CoScientistState:
     scientist_feedback: list[dict[str, str]] = field(default_factory=list)
     iteration: int = 0
     max_iterations: int = 3
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the full operational state for results.json / session restore."""
+        return {
+            "order_id": self.order_id,
+            "research_goal": self.research_goal,
+            "experimental_context": self.experimental_context,
+            "enriched_ptm_data": self.enriched_ptm_data,
+            "kinase_modules": self.kinase_modules,
+            "signal_flow": self.signal_flow,
+            "comovement_clusters": self.comovement_clusters,
+            "rag_collections": self.rag_collections,
+            "hypotheses": [hypothesis.to_dict() for hypothesis in self.hypotheses],
+            "tournament_history": self.tournament_history,
+            "experiment_designs": [design.to_dict() for design in self.experiment_designs],
+            "evidence_graph": self.evidence_graph,
+            "diversity_summary": self.diversity_summary,
+            "meta_review": self.meta_review,
+            "lab_results": [result.to_dict() for result in self.lab_results],
+            "scientist_feedback": self.scientist_feedback,
+            "iteration": self.iteration,
+            "max_iterations": self.max_iterations,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CoScientistState":
+        """Restore a live state object from persisted results or session metadata."""
+        payload = data or {}
+        context = dict(payload.get("experimental_context") or {})
+        enriched = list(payload.get("enriched_ptm_data") or context.get("top_ptms") or [])
+        return cls(
+            order_id=payload.get("order_id"),
+            research_goal=str(payload.get("research_goal") or ""),
+            experimental_context=context,
+            enriched_ptm_data=enriched,
+            kinase_modules=dict(payload.get("kinase_modules") or context.get("kinase_modules") or {}),
+            signal_flow=dict(payload.get("signal_flow") or context.get("signal_flow") or {}),
+            comovement_clusters=dict(
+                payload.get("comovement_clusters") or context.get("comovement_clusters") or {}
+            ),
+            rag_collections=list(payload.get("rag_collections") or []),
+            hypotheses=[
+                Hypothesis.from_dict(item)
+                for item in (payload.get("hypotheses") or [])
+                if isinstance(item, dict)
+            ],
+            tournament_history=list(payload.get("tournament_history") or []),
+            experiment_designs=[
+                ExperimentDesign.from_dict(item)
+                for item in (payload.get("experiment_designs") or [])
+                if isinstance(item, dict)
+            ],
+            evidence_graph=dict(payload.get("evidence_graph") or {}),
+            diversity_summary=dict(payload.get("diversity_summary") or {}),
+            meta_review=dict(payload.get("meta_review") or {}),
+            lab_results=[
+                LabResult.from_dict(item)
+                for item in (payload.get("lab_results") or [])
+                if isinstance(item, dict)
+            ],
+            scientist_feedback=[
+                item for item in (payload.get("scientist_feedback") or []) if isinstance(item, dict)
+            ],
+            iteration=int(payload.get("iteration", 0) or 0),
+            max_iterations=int(payload.get("max_iterations", 3) or 3),
+        )

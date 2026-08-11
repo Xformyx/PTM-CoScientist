@@ -161,13 +161,13 @@ def _build_candidate(hypothesis: Hypothesis, state: CoScientistState) -> tuple[d
     return candidate, candidate["quality_gate"]
 
 
-def _hypothesis_claim(hypothesis: Hypothesis) -> str:
-    """Render a clearly labelled hypothesis rather than a factual claim."""
-    return " ".join(
-        part.strip()
-        for part in (hypothesis.condition, hypothesis.prediction, hypothesis.mechanism)
-        if part and part.strip()
-    )
+def _hypothesis_claim(hypothesis: Hypothesis) -> dict[str, str]:
+    """Export a structured IF–THEN–BECAUSE claim for downstream writers."""
+    return {
+        "if": str(hypothesis.condition or "").strip(),
+        "then": str(hypothesis.prediction or "").strip(),
+        "because": str(hypothesis.mechanism or "").strip(),
+    }
 
 
 def _data_support(sites: Iterable[str], enriched_ptm_data: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

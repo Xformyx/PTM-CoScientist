@@ -127,18 +127,9 @@ def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str)
     # Save
     out_dir = Path(output or settings.coscientist.output_dir) / order_code
     out_dir.mkdir(parents=True, exist_ok=True)
-    results = {
-        "order_code": order_code,
-        "research_goal": goal,
-        "iteration": state.iteration,
-        "tournament_history": state.tournament_history,
-        "hypotheses": [h.to_dict() for h in state.hypotheses],
-        "experiment_designs": [e.to_dict() for e in state.experiment_designs],
-        "lab_results": [result.to_dict() for result in state.lab_results],
-        "evidence_graph": state.evidence_graph,
-        "diversity_summary": state.diversity_summary,
-        "meta_review": state.meta_review,
-    }
+    results = state.to_dict()
+    results["order_code"] = order_code
+    results["research_goal"] = goal
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 

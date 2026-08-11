@@ -135,7 +135,7 @@ Discussion Writer가 패킷을 사용할 때에는 다음 원칙을 지켜야 �
     {
       "id": "h-001",
       "priority_tier": "high",
-      "claim": "IF … THEN … BECAUSE …",
+      "claim": {"if": "…", "then": "…", "because": "…"},
       "supporting_ptm_sites": ["GENE-S123"],
       "data_support": [{"source": "PTM-platform measured data"}],
       "literature_evidence": [{"pmid": "…", "doi": "…", "stance": "supporting"}],
@@ -199,6 +199,8 @@ curl -X POST http://localhost:8080/session/<SESSION_ID>/lab-results \
 ```
 
 Allowed outcomes are `supports`, `contradicts`, and `inconclusive`. Submit the result, then call `POST /session/<SESSION_ID>/rerun` to incorporate it into the next reflection, debate, ranking, and meta-review cycle.
+
+After an API restart, `/scientific-reasoning` and `/lab-results` restore live state from the session's `results.json` when available, otherwise from compacted session metadata (`hypotheses`, `lab_results`, `evidence_graph`, feedback).
 
 ### Interpretation Rules
 

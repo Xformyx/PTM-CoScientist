@@ -123,16 +123,19 @@ def test_split_site_empty():
 def test_hypothesis_claim_full():
     h = _make_hypothesis()
     claim = _hypothesis_claim(h)
-    assert "IF EGFR" in claim
-    assert "THEN SRC" in claim
-    assert "BECAUSE EGFR" in claim
+    assert claim == {
+        "if": h.condition,
+        "then": h.prediction,
+        "because": h.mechanism,
+    }
 
 
 def test_hypothesis_claim_partial():
     h = _make_hypothesis(mechanism="")
     claim = _hypothesis_claim(h)
-    assert "IF EGFR" in claim
-    assert "THEN SRC" in claim
+    assert claim["if"] == h.condition
+    assert claim["then"] == h.prediction
+    assert claim["because"] == ""
 
 
 # ─── _is_citable ────────────────────────────────────────────────────────────
@@ -356,6 +359,15 @@ def test_packet_elo_not_exported():
     packet = build_discussion_evidence_packet(state, session_id="test-01")
     hyp = packet["selected_hypotheses"][0]
     assert "elo_rating" not in hyp
+
+
+def test_packet_claim_is_structured_if_then_because():
+    state = _minimal_state(_full_hypothesis())
+    packet = build_discussion_evidence_packet(state, session_id="test-01")
+    claim = packet["selected_hypotheses"][0]["claim"]
+    assert claim["if"]
+    assert claim["then"]
+    assert claim["because"]
 
 
 def test_packet_priority_tier_assigned():

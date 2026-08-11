@@ -37,10 +37,11 @@ class FakeLLM:
                 },
             ])
         if "performing self-critique" in system_prompt.lower():
+            literature_status = "supported" if "EGFR-SRC paper" in prompt or "99999999" in prompt else "insufficient"
             return json.dumps({
                 "atomic_claims": [{"claim": "EGFR activates SRC", "evidence_status": "untested"}],
                 "data_consistency": "partial",
-                "literature_consistency": "insufficient",
+                "literature_consistency": literature_status,
                 "novelty_assessment": "uncertain",
                 "confounders": ["Total protein abundance may change"],
                 "missing_evidence": ["Direct kinase assay"],
@@ -55,6 +56,8 @@ class FakeLLM:
                 "critique_a": "Needs inhibitor control.",
                 "critique_b": "Temporal evidence is incomplete.",
             })
+        if "literature evidence classifier" in system_prompt.lower():
+            return "SUPPORTING"
         if "evolution specialist" in system_prompt.lower():
             return json.dumps([])
         return "NEUTRAL"
@@ -65,7 +68,17 @@ class FakeChroma:
         return False
 
     def search_for_hypothesis(self, *args, **kwargs):
-        return []
+        return [{
+            "id": "doc-src-1",
+            "document": "EGFR can activate SRC in epithelial models.",
+            "collection": "ptm_articles",
+            "distance": 0.2,
+            "metadata": {
+                "title": "EGFR-SRC paper",
+                "pmid": "99999999",
+                "doi": "10.1000/egfr-src",
+            },
+        }]
 
 
 class FakePTMConnector:
@@ -186,6 +199,11 @@ def test_pipeline_integrates_reflection_graph_and_diversity():
     state = pipeline.run(order_code="ORDER_001", research_goal="Test EGFR signalling")
     assert len(state.hypotheses) == 2
     assert all(hypothesis.reflection for hypothesis in state.hypotheses)
+    assert all(hypothesis.evidence_for for hypothesis in state.hypotheses)
+    assert all(
+        hypothesis.reflection.get("literature_consistency") == "supported"
+        for hypothesis in state.hypotheses
+    )
     assert state.evidence_graph["summary"]["node_count"] > 0
     assert state.diversity_summary["recommended_hypothesis_ids"]
 

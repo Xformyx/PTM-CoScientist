@@ -20,11 +20,14 @@ from pydantic import BaseModel
 
 from config.settings import get_settings
 from src.agents.experiment_designer import run_experiment_design
+from src.agents.meta_reviewer import run_meta_review
+from src.agents.proximity import cluster_and_select_diverse_hypotheses
 from src.connectors.chromadb_connector import ChromaDBConnector
 from src.connectors.ptm_platform_connector import PTMPlatformConnector
 from src.core.discussion_packet import build_discussion_evidence_packet
+from src.core.evidence_graph import build_evidence_graph
 from src.core.llm_client import LLMClient
-from src.core.models import CoScientistState
+from src.core.models import CoScientistState, LabResult
 from src.core.pipeline import CoScientistPipeline
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,10 @@ def _save_sessions() -> None:
                 entry["_hypotheses"] = [h.to_dict() for h in state.hypotheses[:20]]
                 entry["_iteration"] = state.iteration
                 entry["_experiment_designs"] = [e.to_dict() for e in state.experiment_designs[:10]]
+                entry["_lab_results"] = [result.to_dict() for result in state.lab_results]
+                entry["_evidence_graph_summary"] = state.evidence_graph.get("summary", {})
+                entry["_diversity_summary"] = state.diversity_summary
+                entry["_meta_review"] = state.meta_review
                 entry["_discussion_packet"] = build_discussion_evidence_packet(
                     state,
                     session_id=sid,
@@ -117,6 +124,18 @@ class FeedbackRequest(BaseModel):
     session_id: str
     feedback_type: str = "direction"  # direction | constraint | seed_idea
     content: str
+
+
+class LabResultRequest(BaseModel):
+    """Researcher-entered laboratory outcome for a specific hypothesis."""
+
+    hypothesis_id: str
+    outcome: str = "inconclusive"  # supports | contradicts | inconclusive
+    assay_type: str = ""
+    result_summary: str = ""
+    observed_effect: str = ""
+    controls: list[str] = []
+    source_reference: str = ""
 
 
 class SessionResponse(BaseModel):
@@ -315,6 +334,69 @@ def submit_feedback(session_id: str, req: FeedbackRequest):
     }
 
 
+@app.post("/session/{session_id}/lab-results")
+def submit_lab_result(session_id: str, req: LabResultRequest):
+    """Record a researcher-observed lab outcome without overwriting source analysis.
+
+    The outcome becomes explicit evidence for the next Reflection → Debate run.
+    It does not automatically prove or reject a mechanism.
+    """
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state: CoScientistState | None = _sessions[session_id].get("state")
+    if state is None:
+        raise HTTPException(status_code=400, detail="Pipeline hasn't completed yet")
+    valid_ids = {hypothesis.id for hypothesis in state.hypotheses}
+    if req.hypothesis_id not in valid_ids:
+        raise HTTPException(status_code=404, detail="Hypothesis not found in this session")
+    if req.outcome not in {"supports", "contradicts", "inconclusive"}:
+        raise HTTPException(status_code=422, detail="outcome must be supports, contradicts, or inconclusive")
+
+    result = LabResult(
+        hypothesis_id=req.hypothesis_id,
+        outcome=req.outcome,
+        assay_type=req.assay_type,
+        result_summary=req.result_summary,
+        observed_effect=req.observed_effect,
+        controls=req.controls,
+        source_reference=req.source_reference,
+    )
+    state.lab_results.append(result)
+    state.evidence_graph = build_evidence_graph(
+        state.experimental_context,
+        state.hypotheses,
+        state.lab_results,
+    )
+    state.meta_review = {}
+    _save_sessions()
+    return {
+        "status": "lab_result_recorded",
+        "lab_result": result.to_dict(),
+        "message": "Re-run the pipeline to incorporate this evidence into reflection, debate, and ranking.",
+    }
+
+
+@app.get("/session/{session_id}/scientific-reasoning")
+def get_scientific_reasoning(session_id: str) -> dict[str, Any]:
+    """Return graph, diversity, reflection, meta-review, and lab-result provenance."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state: CoScientistState | None = _sessions[session_id].get("state")
+    if state is None:
+        raise HTTPException(status_code=409, detail="No active in-memory reasoning state is available")
+    return {
+        "session_id": session_id,
+        "evidence_graph": state.evidence_graph,
+        "diversity_summary": state.diversity_summary,
+        "meta_review": state.meta_review,
+        "hypothesis_reflections": [
+            {"hypothesis_id": hypothesis.id, "reflection": hypothesis.reflection}
+            for hypothesis in state.hypotheses
+        ],
+        "lab_results": [result.to_dict() for result in state.lab_results],
+    }
+
+
 @app.post("/session/{session_id}/cancel")
 def cancel_pipeline(session_id: str):
     """Request cancellation of a running Co-Scientist session."""
@@ -409,11 +491,16 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             tournament_rounds=settings.coscientist.tournament_rounds,
             evolve_top_k=settings.coscientist.evolve_top_k,
             elo_k_factor=settings.coscientist.elo_k_factor,
+            reflection_enabled=settings.coscientist.reflection_enabled,
+            evidence_graph_enabled=settings.coscientist.evidence_graph_enabled,
+            proximity_enabled=settings.coscientist.proximity_enabled,
+            max_diverse_hypotheses=settings.coscientist.max_diverse_hypotheses,
         )
 
         # Get existing feedback if any
         existing_state = _sessions[session_id].get("state")
         feedback = existing_state.scientist_feedback if existing_state else []
+        lab_results = existing_state.lab_results if existing_state else []
 
         def _check_cancel() -> bool:
             return bool(_sessions.get(session_id, {}).get("cancel_requested"))
@@ -424,6 +511,8 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             ptm_type=req.ptm_type,
             rag_collections=req.rag_collections,
             scientist_feedback=feedback,
+            lab_results=lab_results,
+            prior_hypotheses=existing_state.hypotheses if existing_state else [],
             cancel_check=_check_cancel,
         )
 
@@ -435,14 +524,38 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             _save_sessions()
             return
 
-        # Auto-design experiments for top hypotheses
+        # Preserve diverse candidates for experimental design. Proximity does
+        # not discard any hypothesis; it only prioritises cluster representatives.
+        if settings.coscientist.proximity_enabled:
+            selected_hypotheses, state.diversity_summary = cluster_and_select_diverse_hypotheses(
+                state.hypotheses,
+                max_hypotheses=settings.coscientist.max_diverse_hypotheses,
+            )
+        else:
+            selected_hypotheses = state.hypotheses[:settings.coscientist.max_diverse_hypotheses]
+
         designs = run_experiment_design(
-            hypotheses=state.hypotheses,
+            hypotheses=selected_hypotheses,
             llm=llm,
             experimental_context=state.experimental_context,
-            top_n=5,
+            top_n=len(selected_hypotheses),
         )
         state.experiment_designs = designs
+        state.evidence_graph = build_evidence_graph(
+            state.experimental_context,
+            state.hypotheses,
+            state.lab_results,
+        )
+        if settings.coscientist.meta_review_enabled:
+            state.meta_review = run_meta_review(
+                research_goal=state.research_goal,
+                hypotheses=selected_hypotheses,
+                evidence_graph_summary=state.evidence_graph.get("summary", {}),
+                experiment_designs=state.experiment_designs,
+                lab_results=state.lab_results,
+                scientist_feedback=state.scientist_feedback,
+                llm=llm,
+            )
 
         _sessions[session_id]["state"] = state
         _sessions[session_id]["status"] = "completed"
@@ -510,6 +623,10 @@ def _save_results(
         "hypotheses": [h.to_dict() for h in state.hypotheses],
         "experiment_designs": [e.to_dict() for e in state.experiment_designs],
         "scientist_feedback": state.scientist_feedback,
+        "lab_results": [result.to_dict() for result in state.lab_results],
+        "evidence_graph": state.evidence_graph,
+        "diversity_summary": state.diversity_summary,
+        "meta_review": state.meta_review,
         "discussion_evidence_packet": discussion_packet,
     }
 

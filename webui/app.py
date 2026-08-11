@@ -5,10 +5,7 @@ PTM-CoScientist Web UI (Streamlit)
 추후 PTM-platform 프론트엔드에 통합될 예정.
 """
 
-import json
 import os
-import time
-from pathlib import Path
 
 import requests
 import streamlit as st
@@ -35,7 +32,7 @@ def api_post(endpoint: str, payload: dict) -> dict | None:
     except requests.exceptions.ConnectionError:
         st.error("❌ Co-Scientist API 서버에 연결할 수 없습니다. `coscientist serve` 또는 Docker가 실행 중인지 확인하세요.")
         return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - UI must render API failures instead of crashing
         st.error(f"❌ API 오류: {e}")
         return None
 
@@ -48,7 +45,7 @@ def api_get(endpoint: str) -> dict | None:
     except requests.exceptions.ConnectionError:
         st.error("❌ Co-Scientist API 서버에 연결할 수 없습니다.")
         return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - UI must render API failures instead of crashing
         st.error(f"❌ API 오류: {e}")
         return None
 
@@ -57,7 +54,7 @@ def check_api_health() -> bool:
     try:
         resp = requests.get(f"{API_BASE}/health", timeout=5)
         return resp.status_code == 200
-    except Exception:
+    except Exception:  # noqa: BLE001 - sidebar health check should degrade gracefully
         return False
 
 
@@ -115,11 +112,12 @@ st.title("🧬 PTM-CoScientist")
 st.markdown("**AI Co-Scientist for Post-Translational Modification Research** — Generate · Debate · Evolve")
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 파이프라인 실행",
     "📊 가설 & 토너먼트 결과",
     "🔬 실험 설계",
     "💬 Scientist Feedback",
+    "🧠 Scientific Reasoning",
 ])
 
 
@@ -279,11 +277,30 @@ with tab2:
                             with col_ev1:
                                 st.markdown(f"✅ **지지 근거** ({len(ev_for)}건)")
                                 for ev in ev_for[:2]:
-                                    st.caption(f"📄 {ev.get('source', 'Unknown')}: {ev.get('text', '')[:120]}...")
+                                    title = ev.get("title") or ev.get("source") or "Unknown"
+                                    excerpt = ev.get("excerpt") or ev.get("text") or ""
+                                    st.caption(f"📄 {title}: {excerpt[:120]}...")
                             with col_ev2:
                                 st.markdown(f"❌ **반박 근거** ({len(ev_against)}건)")
                                 for ev in ev_against[:2]:
-                                    st.caption(f"📄 {ev.get('source', 'Unknown')}: {ev.get('text', '')[:120]}...")
+                                    title = ev.get("title") or ev.get("source") or "Unknown"
+                                    excerpt = ev.get("excerpt") or ev.get("text") or ""
+                                    st.caption(f"📄 {title}: {excerpt[:120]}...")
+
+                        reflection = h.get("reflection", {})
+                        if reflection:
+                            st.divider()
+                            st.markdown("🪞 **Self-Critique / Reflection**")
+                            st.caption(reflection.get("summary", ""))
+                            col_ref1, col_ref2 = st.columns(2)
+                            with col_ref1:
+                                st.markdown(f"**Data consistency:** `{reflection.get('data_consistency', 'N/A')}`")
+                                for item in reflection.get("confounders", [])[:3]:
+                                    st.markdown(f"- Confounder: {item}")
+                            with col_ref2:
+                                st.markdown(f"**Recommended action:** `{reflection.get('recommended_action', 'N/A')}`")
+                                for item in reflection.get("falsification_conditions", [])[:3]:
+                                    st.markdown(f"- Falsify if: {item}")
 
                         # Debate History
                         debate = h.get("debate_history", [])
@@ -425,3 +442,117 @@ with tab4:
             for i, fb in enumerate(st.session_state.feedback_history):
                 icon = type_icons.get(fb["type"], "💬")
                 st.markdown(f"**{i+1}.** {icon} `{fb['type'].upper()}` — {fb['content']}")
+
+
+# ─── Tab 5: Scientific Reasoning ───────────────────────────────────────────────
+
+with tab5:
+    st.header("🧠 Scientific Reasoning")
+    st.markdown(
+        "관찰 데이터, 문헌 근거, Self-Critique, 가설 다양성, Meta-review, "
+        "그리고 연구자가 입력한 실험 결과를 하나의 audit trail로 확인합니다."
+    )
+
+    if "session_id" not in st.session_state:
+        st.info("먼저 '파이프라인 실행' 탭에서 분석을 시작하세요.")
+    else:
+        if st.button("🔄 Scientific Reasoning 불러오기", type="primary"):
+            reasoning = api_get(f"/session/{st.session_state.session_id}/scientific-reasoning")
+            if reasoning:
+                st.session_state.reasoning_data = reasoning
+            session_data = api_get(f"/session/{st.session_state.session_id}")
+            if session_data:
+                st.session_state.session_data = session_data
+
+        reasoning = st.session_state.get("reasoning_data", {})
+        if reasoning:
+            graph = reasoning.get("evidence_graph", {})
+            summary = graph.get("summary", {})
+            st.subheader("Evidence Graph")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Nodes", summary.get("node_count", 0))
+            col2.metric("Edges", summary.get("edge_count", 0))
+            col3.metric("Relations", len(summary.get("relations", {})))
+            with st.expander("Graph summary", expanded=False):
+                st.json(summary)
+
+            diversity = reasoning.get("diversity_summary", {})
+            if diversity:
+                st.subheader("Proximity & Diversity")
+                st.caption(
+                    f"Method: `{diversity.get('method', 'N/A')}` | "
+                    f"Clusters: {diversity.get('cluster_count', 0)}"
+                )
+                for cluster in diversity.get("clusters", []):
+                    st.markdown(
+                        f"- `{cluster.get('id', '')}`: representative "
+                        f"`{cluster.get('representative_hypothesis_id', '')}` | "
+                        f"members: {len(cluster.get('member_hypothesis_ids', []))}"
+                    )
+
+            meta_review = reasoning.get("meta_review", {})
+            if meta_review:
+                st.subheader("Meta-review")
+                st.info(meta_review.get("executive_summary", ""))
+                leading = meta_review.get("leading_mechanism", {})
+                if leading:
+                    st.markdown(
+                        f"**Leading candidate:** `{leading.get('hypothesis_id', '')}` — "
+                        f"{leading.get('rationale', '')}"
+                    )
+                if meta_review.get("key_uncertainties"):
+                    st.markdown("**Key uncertainties**")
+                    for item in meta_review["key_uncertainties"]:
+                        st.markdown(f"- {item}")
+
+            reflections = reasoning.get("hypothesis_reflections", [])
+            if reflections:
+                with st.expander("Reflection records", expanded=False):
+                    st.json(reflections)
+
+        st.divider()
+        st.subheader("Lab-in-the-loop: 실험 결과 기록")
+        st.caption(
+            "입력한 결과는 즉시 Evidence Graph에 provenance로 저장됩니다. "
+            "가설의 확정적 증명으로 처리되지 않으며, 재실행 시 Reflection·Debate의 근거로 사용됩니다."
+        )
+        hypotheses = st.session_state.get("session_data", {}).get("top_hypotheses", [])
+        if not hypotheses:
+            st.info("결과를 불러온 후 가설을 선택할 수 있습니다.")
+        else:
+            label_to_id = {
+                f"{hypothesis.get('id', '')} | {hypothesis.get('prediction', '')[:70]}": hypothesis.get("id", "")
+                for hypothesis in hypotheses
+            }
+            with st.form("lab_result_form"):
+                selected_label = st.selectbox("검증한 가설", options=list(label_to_id))
+                outcome = st.selectbox(
+                    "실험 결과",
+                    options=["supports", "contradicts", "inconclusive"],
+                    format_func=lambda value: {
+                        "supports": "Supports — 가설과 일치",
+                        "contradicts": "Contradicts — 가설과 상충",
+                        "inconclusive": "Inconclusive — 판단 불가",
+                    }[value],
+                )
+                assay_type = st.text_input("Assay / Technique", placeholder="예: phospho-Western blot")
+                result_summary = st.text_area("결과 요약", placeholder="관찰한 정량적·정성적 결과를 기록하세요.")
+                observed_effect = st.text_input("관찰된 효과", placeholder="예: EGFR inhibitor 처리 시 SRC-Y416 신호 감소")
+                controls_text = st.text_input("대조군", placeholder="예: vehicle, untreated, kinase-dead mutant")
+                source_reference = st.text_input("원자료 참조", placeholder="예: 실험 노트 ID, 파일명, 내부 보고서 링크")
+                submitted = st.form_submit_button("🧪 실험 결과 기록")
+
+            if submitted:
+                payload = {
+                    "hypothesis_id": label_to_id[selected_label],
+                    "outcome": outcome,
+                    "assay_type": assay_type,
+                    "result_summary": result_summary,
+                    "observed_effect": observed_effect,
+                    "controls": [item.strip() for item in controls_text.split(",") if item.strip()],
+                    "source_reference": source_reference,
+                }
+                result = api_post(f"/session/{st.session_state.session_id}/lab-results", payload)
+                if result:
+                    st.success("✅ 실험 결과가 기록되었습니다.")
+                    st.info("이 결과를 Reflection·Debate·Ranking에 반영하려면 Scientist Feedback 탭에서 재실행하세요.")

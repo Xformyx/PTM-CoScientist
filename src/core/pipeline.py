@@ -1,32 +1,27 @@
-"""
-Co-Scientist Pipeline Orchestrator.
+"""PTM-CoScientist scientific-reasoning pipeline orchestrator."""
 
-Implements the Generate → Debate → Evolve loop using LangGraph StateGraph.
-Supports iterative refinement with Scientist-in-the-loop feedback.
-"""
+from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
 
-from src.core.llm_client import LLMClient
-from src.core.models import CoScientistState, Hypothesis, HypothesisStatus
-from src.core.elo import rank_hypotheses
-from src.connectors.chromadb_connector import ChromaDBConnector
-from src.connectors.ptm_platform_connector import PTMPlatformConnector
-from src.agents.generator import run_generation
 from src.agents.debater import run_debate
 from src.agents.evolver import run_evolution
+from src.agents.generator import run_generation
+from src.agents.proximity import cluster_and_select_diverse_hypotheses
+from src.agents.reflection import run_reflection
+from src.connectors.chromadb_connector import ChromaDBConnector
+from src.connectors.ptm_platform_connector import PTMPlatformConnector
+from src.core.elo import rank_hypotheses
+from src.core.evidence_graph import build_evidence_graph
+from src.core.llm_client import LLMClient
+from src.core.models import CoScientistState, Hypothesis, LabResult
 
 logger = logging.getLogger(__name__)
 
 
 class CoScientistPipeline:
-    """
-    Main orchestrator for the Generate → Debate → Evolve loop.
-
-    Manages the iterative hypothesis refinement cycle with optional
-    scientist feedback between iterations.
-    """
+    """Orchestrate evidence-grounded, iterative PTM scientific reasoning."""
 
     def __init__(
         self,
@@ -38,6 +33,10 @@ class CoScientistPipeline:
         tournament_rounds: int = 3,
         evolve_top_k: int = 3,
         elo_k_factor: int = 32,
+        reflection_enabled: bool = True,
+        evidence_graph_enabled: bool = True,
+        proximity_enabled: bool = True,
+        max_diverse_hypotheses: int = 5,
     ):
         self.llm = llm
         self.chromadb = chromadb
@@ -47,44 +46,39 @@ class CoScientistPipeline:
         self.tournament_rounds = tournament_rounds
         self.evolve_top_k = evolve_top_k
         self.elo_k_factor = elo_k_factor
+        self.reflection_enabled = reflection_enabled
+        self.evidence_graph_enabled = evidence_graph_enabled
+        self.proximity_enabled = proximity_enabled
+        self.max_diverse_hypotheses = max_diverse_hypotheses
 
     def run(
         self,
         order_code: str = "",
         research_goal: str = "",
         ptm_type: str = "phosphorylation",
-        rag_collections: Optional[List[str]] = None,
-        scientist_feedback: Optional[List[Dict[str, str]]] = None,
-        progress_callback=None,
-        order_codes: Optional[List[str]] = None,
-        cancel_check=None,
+        rag_collections: list[str] | None = None,
+        scientist_feedback: list[dict[str, str]] | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
+        order_codes: list[str] | None = None,
+        lab_results: list[LabResult] | None = None,
+        prior_hypotheses: list[Hypothesis] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> CoScientistState:
-        """
-        Execute the full Co-Scientist pipeline.
+        """Execute Generate → Reflection → Debate → Evolve over PTM evidence.
 
-        Args:
-            order_code: Single PTM-platform order code (legacy, use order_codes)
-            order_codes: Multiple order codes for cross-order synthesis
-            research_goal: Natural language research goal
-            ptm_type: "phosphorylation" or "ubiquitylation"
-            rag_collections: Specific ChromaDB collections to use
-            scientist_feedback: Previous feedback from researcher
-            progress_callback: Optional callback(pct, message)
-
-        Returns:
-            CoScientistState with all hypotheses and results
+        Input artifacts and ChromaDB remain read-only. Human feedback and lab
+        results are carried as explicit scientific-reasoning context; neither is
+        silently converted into a causal conclusion.
         """
-        # Normalise: order_codes takes precedence; fall back to single order_code
         codes = order_codes or ([order_code] if order_code else [])
-
         state = CoScientistState(
             research_goal=research_goal,
             rag_collections=rag_collections or [],
             scientist_feedback=scientist_feedback or [],
+            lab_results=lab_results or [],
             max_iterations=self.max_iterations,
         )
 
-        # ─── Phase 1: Load Context ───────────────────────────────────────
         if progress_callback:
             progress_callback(5, "Loading PTM-platform context")
 
@@ -93,28 +87,29 @@ class CoScientistPipeline:
             if len(codes) != 1
             else self.ptm_connector.assemble_context(codes[0], ptm_type)
         )
+        context["research_goal"] = research_goal
         state.enriched_ptm_data = context.get("top_ptms", [])
         state.kinase_modules = context.get("kinase_modules", {})
         state.signal_flow = context.get("signal_flow", {})
         state.comovement_clusters = context.get("comovement_clusters", {})
         state.experimental_context = context
+        logger.info("[Pipeline] Loaded context: %d PTMs", context.get("enriched_ptm_count", 0))
 
-        logger.info(f"[Pipeline] Loaded context: {context.get('enriched_ptm_count', 0)} PTMs")
+        if self.evidence_graph_enabled:
+            state.evidence_graph = build_evidence_graph(context, lab_results=state.lab_results)
+            logger.info("[Pipeline] Built Evidence Graph: %s", state.evidence_graph.get("summary", {}))
 
-        # ─── Phase 2: Iterative Generate → Debate → Evolve ──────────────
-        all_hypotheses: List[Hypothesis] = []
-
+        # Preserve prior candidates on researcher-requested re-runs so that
+        # recorded laboratory outcomes remain linked to the same hypothesis IDs.
+        all_hypotheses: list[Hypothesis] = list(prior_hypotheses or [])
         for iteration in range(self.max_iterations):
             if cancel_check and cancel_check():
-                logger.info(f"[Pipeline] Cancelled before iteration {iteration + 1}")
+                logger.info("[Pipeline] Cancelled before iteration %d", iteration + 1)
                 break
-
             pct_base = 10 + (iteration * 25)
 
             if progress_callback:
                 progress_callback(pct_base, f"Iteration {iteration + 1}: Generating hypotheses")
-
-            # GENERATE
             new_hypotheses = run_generation(
                 context=context,
                 llm=self.llm,
@@ -127,13 +122,29 @@ class CoScientistPipeline:
             all_hypotheses.extend(new_hypotheses)
 
             if cancel_check and cancel_check():
-                logger.info(f"[Pipeline] Cancelled after Generate (iteration {iteration + 1})")
+                logger.info("[Pipeline] Cancelled after Generate (iteration %d)", iteration + 1)
+                break
+
+            if self.evidence_graph_enabled:
+                state.evidence_graph = build_evidence_graph(context, all_hypotheses, state.lab_results)
+
+            if self.reflection_enabled:
+                if progress_callback:
+                    progress_callback(pct_base + 5, f"Iteration {iteration + 1}: Self-critique")
+                all_hypotheses = run_reflection(
+                    all_hypotheses,
+                    context=context,
+                    evidence_graph=state.evidence_graph,
+                    lab_results=state.lab_results,
+                    llm=self.llm,
+                )
+
+            if cancel_check and cancel_check():
+                logger.info("[Pipeline] Cancelled after Reflection (iteration %d)", iteration + 1)
                 break
 
             if progress_callback:
-                progress_callback(pct_base + 8, f"Iteration {iteration + 1}: Debating {len(all_hypotheses)} hypotheses")
-
-            # DEBATE
+                progress_callback(pct_base + 10, f"Iteration {iteration + 1}: Debating {len(all_hypotheses)} hypotheses")
             all_hypotheses = run_debate(
                 hypotheses=all_hypotheses,
                 llm=self.llm,
@@ -144,14 +155,12 @@ class CoScientistPipeline:
             )
 
             if cancel_check and cancel_check():
-                logger.info(f"[Pipeline] Cancelled after Debate (iteration {iteration + 1})")
+                logger.info("[Pipeline] Cancelled after Debate (iteration %d)", iteration + 1)
                 break
 
-            if progress_callback:
-                progress_callback(pct_base + 16, f"Iteration {iteration + 1}: Evolving top hypotheses")
-
-            # EVOLVE (from iteration 1 onward)
             if iteration < self.max_iterations - 1:
+                if progress_callback:
+                    progress_callback(pct_base + 18, f"Iteration {iteration + 1}: Evolving top hypotheses")
                 evolved = run_evolution(
                     hypotheses=all_hypotheses,
                     llm=self.llm,
@@ -160,10 +169,6 @@ class CoScientistPipeline:
                 )
                 all_hypotheses.extend(evolved)
 
-                if cancel_check and cancel_check():
-                    logger.info(f"[Pipeline] Cancelled after Evolve (iteration {iteration + 1})")
-                    break
-
             state.iteration = iteration + 1
             state.tournament_history.append({
                 "iteration": iteration,
@@ -171,32 +176,39 @@ class CoScientistPipeline:
                 "top_elo": all_hypotheses[0].elo_rating if all_hypotheses else 0,
                 "avg_elo": sum(h.elo_rating for h in all_hypotheses) / len(all_hypotheses) if all_hypotheses else 0,
             })
+            logger.info("[Pipeline] Iteration %d complete: %d hypotheses", iteration + 1, len(all_hypotheses))
 
-            logger.info(
-                f"[Pipeline] Iteration {iteration + 1} complete: "
-                f"{len(all_hypotheses)} hypotheses, top Elo={all_hypotheses[0].elo_rating if all_hypotheses else 0}"
-            )
-
-        # ─── Phase 3: Final ranking ─────────────────────────────────────
         state.hypotheses = rank_hypotheses(all_hypotheses)
-
+        if self.proximity_enabled:
+            _, state.diversity_summary = cluster_and_select_diverse_hypotheses(
+                state.hypotheses,
+                max_hypotheses=self.max_diverse_hypotheses,
+            )
+        if self.evidence_graph_enabled:
+            state.evidence_graph = build_evidence_graph(context, state.hypotheses, state.lab_results)
         if progress_callback:
-            progress_callback(90, "Pipeline complete")
-
+            progress_callback(90, "Core scientific reasoning complete")
         return state
 
-    def _build_goal_with_feedback(self, base_goal: str, feedback: List[Dict[str, str]], iteration: int) -> str:
-        """Incorporate scientist feedback into the research goal."""
+    @staticmethod
+    def _build_goal_with_feedback(base_goal: str, feedback: list[dict[str, str]], iteration: int) -> str:
+        """Incorporate explicit research guidance without rewriting source evidence."""
         if not feedback:
             return base_goal
-
         parts = [base_goal]
-        for fb in feedback:
-            if fb.get("type") == "direction":
-                parts.append(f"\nResearcher guidance: {fb['content']}")
-            elif fb.get("type") == "constraint":
-                parts.append(f"\nConstraint: {fb['content']}")
-            elif fb.get("type") == "seed_idea":
-                parts.append(f"\nSeed idea to explore: {fb['content']}")
-
+        for item in feedback:
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            feedback_type = item.get("type")
+            prefix = {
+                "direction": "Researcher guidance",
+                "constraint": "Constraint",
+                "seed_idea": "Seed idea to explore",
+                "hypothesis_decision": "Researcher hypothesis decision",
+                "evidence_feedback": "Researcher evidence feedback",
+            }.get(feedback_type, "Researcher feedback")
+            parts.append(f"\n{prefix}: {content}")
+        if iteration:
+            parts.append(f"\nThis is refinement iteration {iteration + 1}; seek a non-duplicative, evidence-grounded angle.")
         return "\n".join(parts)

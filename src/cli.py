@@ -11,9 +11,8 @@ from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.markdown import Markdown
+from rich.table import Table
 
 console = Console()
 
@@ -21,7 +20,6 @@ console = Console()
 @click.group()
 def main():
     """PTM-CoScientist: AI Co-Scientist for PTM Research."""
-    pass
 
 
 @main.command()
@@ -33,11 +31,13 @@ def main():
 def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str):
     """Run the Co-Scientist pipeline on a PTM-platform order."""
     from config.settings import get_settings
-    from src.core.llm_client import LLMClient
-    from src.core.pipeline import CoScientistPipeline
+    from src.agents.experiment_designer import run_experiment_design
+    from src.agents.meta_reviewer import run_meta_review
+    from src.agents.proximity import cluster_and_select_diverse_hypotheses
     from src.connectors.chromadb_connector import ChromaDBConnector
     from src.connectors.ptm_platform_connector import PTMPlatformConnector
-    from src.agents.experiment_designer import run_experiment_design
+    from src.core.llm_client import LLMClient
+    from src.core.pipeline import CoScientistPipeline
 
     settings = get_settings()
 
@@ -76,6 +76,11 @@ def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str)
         generate_candidates=settings.coscientist.generate_candidates,
         tournament_rounds=settings.coscientist.tournament_rounds,
         evolve_top_k=settings.coscientist.evolve_top_k,
+        elo_k_factor=settings.coscientist.elo_k_factor,
+        reflection_enabled=settings.coscientist.reflection_enabled,
+        evidence_graph_enabled=settings.coscientist.evidence_graph_enabled,
+        proximity_enabled=settings.coscientist.proximity_enabled,
+        max_diverse_hypotheses=settings.coscientist.max_diverse_hypotheses,
     )
 
     def progress(pct, msg):
@@ -89,15 +94,32 @@ def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str)
         progress_callback=progress,
     )
 
-    # Design experiments
+    # Use proximity representatives for a diverse experimental portfolio.
+    if settings.coscientist.proximity_enabled:
+        selected, state.diversity_summary = cluster_and_select_diverse_hypotheses(
+            state.hypotheses,
+            max_hypotheses=settings.coscientist.max_diverse_hypotheses,
+        )
+    else:
+        selected = state.hypotheses[:settings.coscientist.max_diverse_hypotheses]
+
     console.print("\n[bold cyan]Designing experiments...[/bold cyan]\n")
-    designs = run_experiment_design(
-        hypotheses=state.hypotheses,
+    state.experiment_designs = run_experiment_design(
+        hypotheses=selected,
         llm=llm,
         experimental_context=state.experimental_context,
-        top_n=5,
+        top_n=len(selected),
     )
-    state.experiment_designs = designs
+    if settings.coscientist.meta_review_enabled:
+        state.meta_review = run_meta_review(
+            research_goal=state.research_goal,
+            hypotheses=selected,
+            evidence_graph_summary=state.evidence_graph.get("summary", {}),
+            experiment_designs=state.experiment_designs,
+            lab_results=state.lab_results,
+            scientist_feedback=state.scientist_feedback,
+            llm=llm,
+        )
 
     # Display results
     _display_results(state)
@@ -112,6 +134,10 @@ def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str)
         "tournament_history": state.tournament_history,
         "hypotheses": [h.to_dict() for h in state.hypotheses],
         "experiment_designs": [e.to_dict() for e in state.experiment_designs],
+        "lab_results": [result.to_dict() for result in state.lab_results],
+        "evidence_graph": state.evidence_graph,
+        "diversity_summary": state.diversity_summary,
+        "meta_review": state.meta_review,
     }
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -139,7 +165,6 @@ def show(results_file: str):
     with open(path) as f:
         data = json.load(f)
 
-    from src.core.models import Hypothesis, ExperimentDesign
     hypotheses = data.get("hypotheses", [])
     designs = data.get("experiment_designs", [])
 

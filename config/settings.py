@@ -1,20 +1,24 @@
-"""
-PTM-CoScientist Configuration.
+"""PTM-CoScientist Configuration.
 
-All configurable values are centralized here.
-Reads from environment variables with sensible defaults.
+All configurable values are centralised here and read from environment variables.
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
 class LLMConfig:
     """LLM provider configuration (mirrors PTM-platform's LLMClient)."""
 
-    provider: str = os.getenv("LLM_PROVIDER", "auto")  # auto | ollama | openai | gemini
+    provider: str = os.getenv("LLM_PROVIDER", "auto")
     ollama_url: str = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
     ollama_model: str = os.getenv("LLM_MODEL", "gemma3:27b")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
@@ -27,24 +31,19 @@ class LLMConfig:
 
 @dataclass
 class PTMPlatformConfig:
-    """Connection settings for reading PTM-platform artifacts (read-only)."""
+    """Read-only connection settings for PTM-platform outputs."""
 
-    # ChromaDB (shared instance from PTM-platform)
     chromadb_url: str = os.getenv("CHROMADB_URL", "http://localhost:8000")
-
-    # MySQL (read-only access to PTM-platform's orders/enriched data)
     database_url: str = os.getenv(
         "DATABASE_URL",
         "mysql+asyncmy://ptm_reader:reader_password@localhost:3306/ptm_platform?charset=utf8mb4",
     )
-
-    # File-based artifacts (mounted volume from PTM-platform)
     artifacts_dir: str = os.getenv("PTM_ARTIFACTS_DIR", "/data/ptm-platform/outputs")
 
 
 @dataclass
 class CoScientistConfig:
-    """Co-Scientist pipeline configuration."""
+    """Pipeline and scientific-reasoning configuration."""
 
     # Tournament settings
     max_hypotheses: int = int(os.getenv("MAX_HYPOTHESES", "10"))
@@ -56,6 +55,13 @@ class CoScientistConfig:
     generate_candidates: int = int(os.getenv("GENERATE_CANDIDATES", "5"))
     debate_depth: int = int(os.getenv("DEBATE_DEPTH", "2"))
     evolve_top_k: int = int(os.getenv("EVOLVE_TOP_K", "3"))
+
+    # Scientific reasoning extensions
+    reflection_enabled: bool = _env_bool("REFLECTION_ENABLED", True)
+    evidence_graph_enabled: bool = _env_bool("EVIDENCE_GRAPH_ENABLED", True)
+    proximity_enabled: bool = _env_bool("PROXIMITY_ENABLED", True)
+    meta_review_enabled: bool = _env_bool("META_REVIEW_ENABLED", True)
+    max_diverse_hypotheses: int = int(os.getenv("MAX_DIVERSE_HYPOTHESES", "5"))
 
     # Output
     output_dir: str = os.getenv("COSCIENTIST_OUTPUT_DIR", "/data/coscientist/outputs")
@@ -71,5 +77,5 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    """Factory to create settings from environment."""
+    """Create settings from environment."""
     return Settings()

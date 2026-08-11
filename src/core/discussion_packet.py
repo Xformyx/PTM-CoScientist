@@ -39,7 +39,7 @@ def build_discussion_evidence_packet(
 
     selected: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
-    ranked = sorted(state.hypotheses, key=lambda hypothesis: hypothesis.elo_rating, reverse=True)
+    ranked = _ordered_hypotheses(state)
 
     for hypothesis in ranked:
         candidate, gate = _build_candidate(hypothesis, state)
@@ -77,6 +77,10 @@ def build_discussion_evidence_packet(
         ),
         "selected_hypotheses": selected,
         "experiment_priorities": experiment_priorities,
+        "evidence_graph_summary": state.evidence_graph.get("summary", {}),
+        "diversity_summary": state.diversity_summary,
+        "meta_review": state.meta_review,
+        "laboratory_evidence": [result.to_dict() for result in state.lab_results],
         "quality_summary": {
             "evaluated_hypotheses": len(ranked),
             "eligible_hypotheses": len(selected),
@@ -86,12 +90,27 @@ def build_discussion_evidence_packet(
     }
 
 
+def _ordered_hypotheses(state: CoScientistState) -> list[Hypothesis]:
+    """Use proximity-selected representatives first, then preserve all candidates."""
+    ranked = sorted(state.hypotheses, key=lambda hypothesis: hypothesis.elo_rating, reverse=True)
+    recommended_ids = state.diversity_summary.get("recommended_hypothesis_ids", [])
+    if not isinstance(recommended_ids, list) or not recommended_ids:
+        return ranked
+    by_id = {hypothesis.id: hypothesis for hypothesis in ranked}
+    preferred = [by_id[hypothesis_id] for hypothesis_id in recommended_ids if hypothesis_id in by_id]
+    preferred_ids = {hypothesis.id for hypothesis in preferred}
+    return preferred + [hypothesis for hypothesis in ranked if hypothesis.id not in preferred_ids]
+
+
 def _build_candidate(hypothesis: Hypothesis, state: CoScientistState) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build one candidate and evaluate the report-safety quality gates."""
     data_support = _data_support(hypothesis.supporting_ptms, state.enriched_ptm_data)
     literature_evidence = _normalize_evidence(hypothesis.evidence_for, "supporting")
     counter_evidence = _normalize_evidence(hypothesis.evidence_against, "contradicting")
     limitations = _collect_limitations(hypothesis, counter_evidence)
+    experimental_evidence = [
+        result.to_dict() for result in state.lab_results if result.hypothesis_id == hypothesis.id
+    ]
 
     claim = _hypothesis_claim(hypothesis)
     has_structured_claim = bool(hypothesis.condition and hypothesis.prediction and hypothesis.mechanism)
@@ -121,6 +140,8 @@ def _build_candidate(hypothesis: Hypothesis, state: CoScientistState) -> tuple[d
         "counter_evidence": counter_evidence,
         "limitations": limitations,
         "testable_prediction": hypothesis.testable_prediction,
+        "reflection": hypothesis.reflection,
+        "experimental_evidence": experimental_evidence,
         "lineage": {
             "parent_hypothesis_ids": hypothesis.parent_hypothesis_ids,
             "evolution_type": hypothesis.evolution_type,

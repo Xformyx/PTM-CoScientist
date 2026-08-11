@@ -149,3 +149,57 @@ Discussion Writer가 패킷을 사용할 때에는 다음 원칙을 지켜야 �
 ```
 
 See `tests/test_discussion_packet.py` for executable packet and quality-gate examples.
+
+## Scientific Reasoning Extensions
+
+PTM-CoScientist now exposes an evidence-bounded scientific-reasoning loop in addition to the original `Generate → Debate → Evolve` workflow. The extensions keep PTM-platform artifacts and ChromaDB strictly read-only, and they never convert an AI suggestion into a measured finding.
+
+| Component | Role |
+|---|---|
+| **PTM Evidence Graph** | Builds a portable JSON graph linking observed PTM sites, proteins, kinase/E3 modules, pathways, declared signal-flow edges, temporal clusters, literature, hypotheses, and researcher-entered lab outcomes. |
+| **Reflection Agent** | Performs pre-debate self-critique: atomic claims, data/literature consistency, novelty, confounders, evidence gaps, falsification conditions, and an advance/revise/deprioritize recommendation. |
+| **Proximity Agent** | Clusters near-duplicate hypotheses using transparent PTM-site-first feature overlap and selects diverse representatives without deleting candidates. |
+| **Meta-review Agent** | Synthesizes diverse candidates, reflection records, graph summary, proposed experiments, laboratory outcomes, and researcher feedback into a bounded decision-support summary. |
+| **Lab-in-the-loop** | Allows researchers to record `supports`, `contradicts`, or `inconclusive` assay outcomes. These are preserved as explicit evidence and affect the next Reflection → Debate → Evolution run; they do not automatically prove causality. |
+
+### Configuration
+
+All extensions are enabled by default and can be controlled independently for cost, rollout, or ablation testing.
+
+```bash
+REFLECTION_ENABLED=true
+EVIDENCE_GRAPH_ENABLED=true
+PROXIMITY_ENABLED=true
+META_REVIEW_ENABLED=true
+MAX_DIVERSE_HYPOTHESES=5
+```
+
+### Scientific Reasoning API
+
+Retrieve the structured graph and reasoning records for a completed session:
+
+```bash
+curl http://localhost:8080/session/<SESSION_ID>/scientific-reasoning
+```
+
+Record a researcher-observed laboratory result for an existing hypothesis:
+
+```bash
+curl -X POST http://localhost:8080/session/<SESSION_ID>/lab-results \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hypothesis_id": "<HYPOTHESIS_ID>",
+    "outcome": "supports",
+    "assay_type": "phospho-Western blot",
+    "result_summary": "EGFR inhibition reduced SRC-Y416 signal versus vehicle.",
+    "observed_effect": "SRC-Y416 decrease after intervention",
+    "controls": ["vehicle", "untreated"],
+    "source_reference": "lab-notebook-2026-001"
+  }'
+```
+
+Allowed outcomes are `supports`, `contradicts`, and `inconclusive`. Submit the result, then call `POST /session/<SESSION_ID>/rerun` to incorporate it into the next reflection, debate, ranking, and meta-review cycle.
+
+### Interpretation Rules
+
+The graph, reflection records, proximity clusters, Elo ratings, meta-review, and experiment proposals are decision-support artifacts. They are not statistical validation, causal proof, or publication-ready factual claims. For PTM-platform report integration, use only the quality-gated Discussion Evidence Packet, re-resolve literature identifiers in the PTM-platform citation store, and describe candidates with hypothesis language such as *suggests*, *may*, and *warrants testing*.

@@ -232,6 +232,20 @@ def _generate_matchups(hypotheses: list[Hypothesis]) -> list[tuple[Hypothesis, H
         return pairs
 
 
+def _reflection_concerns(hypothesis: Hypothesis) -> str:
+    """Summarise self-critique without treating it as independent evidence."""
+    reflection = hypothesis.reflection or {}
+    concerns = []
+    for key in ("confounders", "missing_evidence", "falsification_conditions"):
+        values = reflection.get(key, [])
+        if isinstance(values, list):
+            concerns.extend(str(value) for value in values if str(value).strip())
+    action = reflection.get("recommended_action")
+    if action:
+        concerns.append(f"recommended_action={action}")
+    return "; ".join(concerns[:4]) or "No structured reflection available"
+
+
 def _debate_pair(h_a: Hypothesis, h_b: Hypothesis, llm: LLMClient) -> tuple[str, dict]:
     """Run a debate between two hypotheses."""
     prompt = f"""## Hypothesis A
@@ -241,6 +255,7 @@ BECAUSE: {h_a.mechanism}
 Supporting PTMs: {', '.join(h_a.supporting_ptms[:5])}
 Signaling chain: {h_a.signaling_chain}
 Literature support: {len(h_a.evidence_for)} papers
+Reflection concerns: {_reflection_concerns(h_a)}
 
 ## Hypothesis B
 IF: {h_b.condition}
@@ -249,6 +264,7 @@ BECAUSE: {h_b.mechanism}
 Supporting PTMs: {', '.join(h_b.supporting_ptms[:5])}
 Signaling chain: {h_b.signaling_chain}
 Literature support: {len(h_b.evidence_for)} papers
+Reflection concerns: {_reflection_concerns(h_b)}
 
 Which hypothesis is scientifically stronger?"""
 

@@ -11,10 +11,10 @@ Generates concrete experimental protocols including:
 
 import json
 import logging
-from typing import List, Dict, Any
+from typing import Any
 
 from src.core.llm_client import LLMClient
-from src.core.models import Hypothesis, ExperimentDesign
+from src.core.models import ExperimentDesign, Hypothesis
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +59,11 @@ Return ONLY a valid JSON array:
 
 
 def run_experiment_design(
-    hypotheses: List[Hypothesis],
+    hypotheses: list[Hypothesis],
     llm: LLMClient,
-    experimental_context: Dict[str, Any] = None,
+    experimental_context: dict[str, Any] | None = None,
     top_n: int = 5,
-) -> List[ExperimentDesign]:
+) -> list[ExperimentDesign]:
     """
     Design experiments for the top-ranked hypotheses.
 
@@ -97,8 +97,8 @@ def run_experiment_design(
 def _design_for_hypothesis(
     hypothesis: Hypothesis,
     llm: LLMClient,
-    experimental_context: Dict[str, Any] = None,
-) -> List[ExperimentDesign]:
+    experimental_context: dict[str, Any] | None = None,
+) -> list[ExperimentDesign]:
     """Design experiments for a single hypothesis."""
     prompt = _build_prompt(hypothesis, experimental_context)
 
@@ -113,7 +113,7 @@ def _design_for_hypothesis(
     return designs
 
 
-def _build_prompt(hypothesis: Hypothesis, context: Dict[str, Any] = None) -> str:
+def _build_prompt(hypothesis: Hypothesis, context: dict[str, Any] | None = None) -> str:
     """Build experiment design prompt."""
     parts = [
         "## Hypothesis to Test",
@@ -130,7 +130,11 @@ def _build_prompt(hypothesis: Hypothesis, context: Dict[str, Any] = None) -> str
     if hypothesis.evidence_for:
         parts.append(f"\n## Supporting Literature ({len(hypothesis.evidence_for)} papers)")
         for ev in hypothesis.evidence_for[:3]:
-            parts.append(f"- {ev.get('source', 'Unknown')}: {ev.get('text', '')[:150]}")
+            title = ev.get("title") or ev.get("source") or "Unknown"
+            excerpt = ev.get("excerpt") or ev.get("text") or ""
+            identifier = ev.get("pmid") or ev.get("doi") or ev.get("evidence_id") or ""
+            suffix = f" [{identifier}]" if identifier else ""
+            parts.append(f"- {title}{suffix}: {excerpt[:300]}")
 
     # Lab context
     if context:
@@ -152,7 +156,7 @@ def _build_prompt(hypothesis: Hypothesis, context: Dict[str, Any] = None) -> str
     return "\n".join(parts)
 
 
-def _parse_response(response: str, hypothesis_id: str) -> List[ExperimentDesign]:
+def _parse_response(response: str, hypothesis_id: str) -> list[ExperimentDesign]:
     """Parse experiment designs from LLM response."""
     text = response.strip()
     if text.startswith("```"):

@@ -330,7 +330,7 @@ with tab3:
             if st.button("🔬 실험 설계 생성", type="primary"):
                 with st.spinner("실험 프로토콜 생성 중..."):
                     result = api_post(
-                        f"/session/{st.session_state.session_id}/design-experiments",
+                        f"/session/{st.session_state.session_id}/design-experiments?top_n={int(top_n)}",
                         {},
                     )
                     if result:
@@ -432,7 +432,12 @@ with tab4:
                     "content": feedback_content,
                 })
                 st.success(f"✅ 피드백이 제출되었습니다. (총 {result.get('total_feedback', 0)}개)")
-                st.info("'파이프라인 실행' 탭에서 파이프라인을 재실행하면 이 피드백이 다음 이터레이션에 반영됩니다.")
+                st.info("아래 '피드백 반영해 재실행'을 누르면 같은 세션에서 다음 이터레이션에 반영됩니다.")
+
+        if st.button("🔁 피드백 반영해 재실행", use_container_width=True):
+            result = api_post(f"/session/{st.session_state.session_id}/rerun", {})
+            if result:
+                st.success("재실행을 시작했습니다. '가설 & 토너먼트 결과' 탭에서 상태를 새로고침하세요.")
 
         # Feedback History
         if st.session_state.get("feedback_history"):
@@ -555,4 +560,4 @@ with tab5:
                 result = api_post(f"/session/{st.session_state.session_id}/lab-results", payload)
                 if result:
                     st.success("✅ 실험 결과가 기록되었습니다.")
-                    st.info("이 결과를 Reflection·Debate·Ranking에 반영하려면 Scientist Feedback 탭에서 재실행하세요.")
+                    st.info("이 결과를 반영하려면 Scientist Feedback 탭의 '피드백 반영해 재실행'을 누르세요.")

@@ -37,6 +37,7 @@ class CoScientistPipeline:
         evidence_graph_enabled: bool = True,
         proximity_enabled: bool = True,
         max_diverse_hypotheses: int = 5,
+        max_hypotheses: int = 10,
     ):
         self.llm = llm
         self.chromadb = chromadb
@@ -50,6 +51,7 @@ class CoScientistPipeline:
         self.evidence_graph_enabled = evidence_graph_enabled
         self.proximity_enabled = proximity_enabled
         self.max_diverse_hypotheses = max_diverse_hypotheses
+        self.max_hypotheses = max_hypotheses
 
     def run(
         self,
@@ -95,13 +97,24 @@ class CoScientistPipeline:
         state.experimental_context = context
         logger.info("[Pipeline] Loaded context: %d PTMs", context.get("enriched_ptm_count", 0))
 
+        if not state.enriched_ptm_data and not int(context.get("enriched_ptm_count") or 0):
+            labels = ", ".join(codes) if codes else "(none)"
+            raise ValueError(
+                f"No PTM artifacts found for order(s): {labels}. "
+                "Confirm the order code and that enriched_ptm_data_*.json exists."
+            )
+
         if self.evidence_graph_enabled:
             state.evidence_graph = build_evidence_graph(context, lab_results=state.lab_results)
             logger.info("[Pipeline] Built Evidence Graph: %s", state.evidence_graph.get("summary", {}))
 
-        # Preserve prior candidates on researcher-requested re-runs so that
-        # recorded laboratory outcomes remain linked to the same hypothesis IDs.
-        all_hypotheses: list[Hypothesis] = list(prior_hypotheses or [])
+        # Keep lab-linked and top prior candidates on rerun, but cap the pool so
+        # each rerun does not unbounded-accumulate every previous generation.
+        all_hypotheses = self._retain_hypotheses(
+            list(prior_hypotheses or []),
+            state.lab_results,
+            self.max_hypotheses,
+        )
         for iteration in range(self.max_iterations):
             if cancel_check and cancel_check():
                 logger.info("[Pipeline] Cancelled before iteration %d", iteration + 1)
@@ -120,6 +133,11 @@ class CoScientistPipeline:
                 rag_collections=rag_collections,
             )
             all_hypotheses.extend(new_hypotheses)
+            all_hypotheses = self._retain_hypotheses(
+                all_hypotheses,
+                state.lab_results,
+                self.max_hypotheses + self.generate_candidates,
+            )
 
             if cancel_check and cancel_check():
                 logger.info("[Pipeline] Cancelled after Generate (iteration %d)", iteration + 1)
@@ -182,6 +200,11 @@ class CoScientistPipeline:
                     context=context,
                 )
                 all_hypotheses.extend(evolved)
+                all_hypotheses = self._retain_hypotheses(
+                    all_hypotheses,
+                    state.lab_results,
+                    self.max_hypotheses + self.evolve_top_k,
+                )
 
             state.iteration = iteration + 1
             state.tournament_history.append({
@@ -192,7 +215,11 @@ class CoScientistPipeline:
             })
             logger.info("[Pipeline] Iteration %d complete: %d hypotheses", iteration + 1, len(all_hypotheses))
 
-        state.hypotheses = rank_hypotheses(all_hypotheses)
+        state.hypotheses = self._retain_hypotheses(
+            rank_hypotheses(all_hypotheses),
+            state.lab_results,
+            self.max_hypotheses,
+        )
         if self.proximity_enabled:
             _, state.diversity_summary = cluster_and_select_diverse_hypotheses(
                 state.hypotheses,
@@ -226,3 +253,18 @@ class CoScientistPipeline:
         if iteration:
             parts.append(f"\nThis is refinement iteration {iteration + 1}; seek a non-duplicative, evidence-grounded angle.")
         return "\n".join(parts)
+
+    @staticmethod
+    def _retain_hypotheses(
+        hypotheses: list[Hypothesis],
+        lab_results: list[LabResult],
+        max_n: int,
+    ) -> list[Hypothesis]:
+        """Keep lab-linked IDs and the strongest remaining candidates, capped."""
+        if max_n <= 0 or len(hypotheses) <= max_n:
+            return hypotheses
+        lab_ids = {result.hypothesis_id for result in lab_results}
+        linked = [hypothesis for hypothesis in hypotheses if hypothesis.id in lab_ids]
+        rest = rank_hypotheses([hypothesis for hypothesis in hypotheses if hypothesis.id not in lab_ids])
+        room = max(0, max_n - len(linked))
+        return linked + rest[:room]

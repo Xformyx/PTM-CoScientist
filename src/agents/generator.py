@@ -116,10 +116,13 @@ def _build_user_prompt(
     if top_ptms:
         ptm_lines = []
         for p in top_ptms[:15]:
-            fc = p.get("ptm_relative_log2fc", 0)
+            try:
+                fc = float(p.get("ptm_relative_log2fc", 0) or 0)
+            except (TypeError, ValueError):
+                fc = 0.0
             direction = "↑" if fc > 0 else "↓"
             ptm_lines.append(
-                f"- {p['gene']}-{p['position']} ({direction} Log2FC={fc:.2f}) "
+                f"- {p.get('gene', '')}-{p.get('position', '')} ({direction} Log2FC={fc:.2f}) "
                 f"Pathways: {', '.join(str(pw) for pw in p.get('pathways', [])[:2])}"
             )
         parts.append("## Key PTM Sites\n" + "\n".join(ptm_lines))
@@ -148,11 +151,14 @@ def _build_user_prompt(
     if cross_sites and order_count > 1:
         lines = []
         for p in cross_sites[:10]:
-            fc = p.get("ptm_relative_log2fc", 0)
+            try:
+                fc = float(p.get("ptm_relative_log2fc", 0) or 0)
+            except (TypeError, ValueError):
+                fc = 0.0
             direction = "↑" if fc > 0 else "↓"
             lines.append(
-                f"- {p['gene']}-{p['position']} ({direction} {abs(fc):.2f}) "
-                f"appears in {p['occurrence_count']}/{order_count} orders"
+                f"- {p.get('gene', '')}-{p.get('position', '')} ({direction} {abs(fc):.2f}) "
+                f"appears in {p.get('occurrence_count', 1)}/{order_count} orders"
             )
         parts.append(
             f"## Cross-Experiment Consensus Sites ({len(cross_sites)} sites across {order_count} orders)\n"

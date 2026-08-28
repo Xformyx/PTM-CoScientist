@@ -37,7 +37,7 @@ app = FastAPI(title="PTM-CoScientist", version="0.1.0")
 _SESSION_FILE = Path(
     os.getenv("COSCIENTIST_SESSION_FILE", "/data/coscientist/outputs/.sessions.json")
 )
-_sessions_lock = threading.Lock()
+_sessions_lock = threading.RLock()
 
 
 def _sessions_path() -> Path:
@@ -72,16 +72,24 @@ def _save_sessions() -> None:
     """
     p = _sessions_path()
     try:
-        serialisable = {}
-        for sid, s in _sessions.items():
-            entry = {k: v for k, v in s.items() if k != "state"}
-            state: CoScientistState | None = s.get("state")
-            if state is not None:
-                entry.update(_compact_state_fields(state, sid, s))
-            serialisable[sid] = entry
+        with _sessions_lock:
+            serialisable = {}
+            for sid, s in _sessions.items():
+                entry = {k: v for k, v in s.items() if k != "state"}
+                state: CoScientistState | None = s.get("state")
+                if state is not None:
+                    entry.update(_compact_state_fields(state, sid, s))
+                serialisable[sid] = entry
         p.write_text(json.dumps(serialisable, default=str))
     except Exception as e:  # noqa: BLE001 - persistence failures are logged without breaking active sessions
         logger.warning(f"[Sessions] Failed to save sessions: {e}")
+
+
+def _require_session(session_id: str) -> dict:
+    with _sessions_lock:
+        if session_id not in _sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return _sessions[session_id]
 
 
 def _compact_state_fields(state: CoScientistState, session_id: str, session: dict[str, Any]) -> dict[str, Any]:
@@ -176,10 +184,9 @@ def _restore_state_from_session_entry(session: dict[str, Any]) -> CoScientistSta
 
 def _ensure_live_state(session_id: str, *, require_hypotheses: bool = False) -> CoScientistState:
     """Return an in-memory state, restoring from disk after server restart if needed."""
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    session = _sessions[session_id]
-    state: CoScientistState | None = session.get("state")
+    session = _require_session(session_id)
+    with _sessions_lock:
+        state: CoScientistState | None = session.get("state")
     if state is None:
         state = _restore_state_from_results(session_id) or _restore_state_from_session_entry(session)
         if state is None:
@@ -187,7 +194,8 @@ def _ensure_live_state(session_id: str, *, require_hypotheses: bool = False) -> 
                 status_code=409,
                 detail="No restorable Co-Scientist reasoning state is available",
             )
-        session["state"] = state
+        with _sessions_lock:
+            session["state"] = state
         logger.info("[Sessions] Restored live state for session %s", session_id)
     if require_hypotheses and not state.hypotheses:
         raise HTTPException(status_code=400, detail="No hypotheses available")
@@ -247,6 +255,7 @@ class SessionResponse(BaseModel):
     top_hypotheses: list
     experiment_designs: list
     error: str | None = None
+    order_codes: list[str] = []
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────
@@ -304,16 +313,19 @@ def health_detailed() -> dict[str, Any]:
 def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
     """Start a new Co-Scientist session."""
     import uuid
+    if not req.resolved_order_codes:
+        raise HTTPException(status_code=422, detail="order_codes or order_code is required")
     session_id = str(uuid.uuid4())[:8]
 
-    _sessions[session_id] = {
-        "status": "running",
-        "state": None,
-        "request": req.model_dump(),
-        "created_at": datetime.now(UTC).isoformat(),
-        "order_codes": req.resolved_order_codes,
-    }
-    _save_sessions()
+    with _sessions_lock:
+        _sessions[session_id] = {
+            "status": "running",
+            "state": None,
+            "request": req.model_dump(),
+            "created_at": datetime.now(UTC).isoformat(),
+            "order_codes": req.resolved_order_codes,
+        }
+        _save_sessions()
 
     background_tasks.add_task(_execute_pipeline, session_id, req)
 
@@ -323,22 +335,27 @@ def run_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
 @app.get("/session/{session_id}")
 def get_session(session_id: str) -> SessionResponse:
     """Get current state of a Co-Scientist session."""
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    session = _sessions[session_id]
-    state: CoScientistState | None = session.get("state")
+    session = _require_session(session_id)
+    with _sessions_lock:
+        state: CoScientistState | None = session.get("state")
+        order_codes = list(session.get("order_codes") or [])
+        status = session["status"]
+        error = session.get("error")
+        compacted_hyps = session.get("_hypotheses", [])
+        compacted_designs = session.get("_experiment_designs", [])
+        compacted_iter = session.get("_iteration", 0)
 
     if state is None:
         # Fall back to persisted hypothesis data (survives restarts)
         return SessionResponse(
             session_id=session_id,
-            status=session["status"],
-            iteration=session.get("_iteration", 0),
-            total_hypotheses=len(session.get("_hypotheses", [])),
-            top_hypotheses=session.get("_hypotheses", [])[:10],
-            experiment_designs=session.get("_experiment_designs", []),
-            error=session.get("error"),
+            status=status,
+            iteration=compacted_iter,
+            total_hypotheses=len(compacted_hyps),
+            top_hypotheses=compacted_hyps[:10],
+            experiment_designs=compacted_designs,
+            error=error,
+            order_codes=order_codes,
         )
 
     top_hyps = [h.to_dict() for h in state.hypotheses[:10]]
@@ -346,11 +363,13 @@ def get_session(session_id: str) -> SessionResponse:
 
     return SessionResponse(
         session_id=session_id,
-        status=session["status"],
+        status=status,
         iteration=state.iteration,
         total_hypotheses=len(state.hypotheses),
         top_hypotheses=top_hyps,
         experiment_designs=exp_designs,
+        error=error,
+        order_codes=order_codes,
     )
 
 
@@ -362,11 +381,9 @@ def get_discussion_packet(session_id: str, max_hypotheses: int = 3) -> dict[str,
     prose. PTM-platform should cite and render the packet under its own report
     rules after verifying the listed identifiers against its literature store.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    session = _sessions[session_id]
-    state: CoScientistState | None = session.get("state")
+    session = _require_session(session_id)
+    with _sessions_lock:
+        state: CoScientistState | None = session.get("state")
     max_hypotheses = max(1, min(max_hypotheses, 5))
 
     if state is not None:
@@ -391,7 +408,9 @@ def get_discussion_packet(session_id: str, max_hypotheses: int = 3) -> dict[str,
 def list_sessions(order_code: str = "", limit: int = 50):
     """List all sessions, optionally filtered by order_code."""
     rows = []
-    for sid, s in _sessions.items():
+    with _sessions_lock:
+        items = list(_sessions.items())
+    for sid, s in items:
         codes: list[str] = s.get("order_codes") or []
         if order_code and order_code not in codes:
             continue
@@ -496,15 +515,13 @@ def get_scientific_reasoning(session_id: str) -> dict[str, Any]:
 @app.post("/session/{session_id}/cancel")
 def cancel_pipeline(session_id: str):
     """Request cancellation of a running Co-Scientist session."""
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    session = _sessions[session_id]
-    if session["status"] != "running":
-        return {"session_id": session_id, "status": session["status"], "message": "Not running"}
-    # Set a cancel flag; _execute_pipeline checks it each iteration
-    session["cancel_requested"] = True
-    session["status"] = "cancelling"
-    _save_sessions()
+    session = _require_session(session_id)
+    with _sessions_lock:
+        if session["status"] != "running":
+            return {"session_id": session_id, "status": session["status"], "message": "Not running"}
+        session["cancel_requested"] = True
+        session["status"] = "cancelling"
+        _save_sessions()
     return {"session_id": session_id, "status": "cancelling"}
 
 
@@ -516,19 +533,16 @@ def rerun_pipeline(session_id: str, background_tasks: BackgroundTasks):
     Reuses the original RunRequest (order_code, ptm_type, rag_collections, etc.)
     and appends the accumulated scientist_feedback as guidance for the new run.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    session = _sessions[session_id]
-    if session["status"] == "running":
-        raise HTTPException(status_code=409, detail="Pipeline is already running")
-
-    # Restore original request
-    req_data = session.get("request", {})
+    session = _require_session(session_id)
+    with _sessions_lock:
+        if session["status"] in {"running", "cancelling"}:
+            raise HTTPException(status_code=409, detail="Pipeline is already running or cancelling")
+        req_data = session.get("request", {})
+        session["status"] = "running"
+        session["cancel_requested"] = False
+        session["error"] = None
+        _save_sessions()
     req = RunRequest(**req_data)
-
-    # Mark as running again (preserving accumulated feedback on existing state)
-    session["status"] = "running"
 
     background_tasks.add_task(_execute_pipeline, session_id, req)
     return {"session_id": session_id, "status": "restarted"}
@@ -585,24 +599,29 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             evidence_graph_enabled=settings.coscientist.evidence_graph_enabled,
             proximity_enabled=settings.coscientist.proximity_enabled,
             max_diverse_hypotheses=settings.coscientist.max_diverse_hypotheses,
+            max_hypotheses=settings.coscientist.max_hypotheses,
         )
 
         # Restore prior feedback/lab results/hypotheses after restart when needed.
         # Fresh /run sessions have no restorable state yet; that is expected.
-        existing_state: CoScientistState | None = _sessions[session_id].get("state")
+        with _sessions_lock:
+            existing_state: CoScientistState | None = _sessions[session_id].get("state")
+            session_snapshot = _sessions[session_id]
         if existing_state is None:
             existing_state = (
                 _restore_state_from_results(session_id)
-                or _restore_state_from_session_entry(_sessions[session_id])
+                or _restore_state_from_session_entry(session_snapshot)
             )
             if existing_state is not None:
-                _sessions[session_id]["state"] = existing_state
+                with _sessions_lock:
+                    _sessions[session_id]["state"] = existing_state
         feedback = existing_state.scientist_feedback if existing_state else []
         lab_results = existing_state.lab_results if existing_state else []
         prior_hypotheses = existing_state.hypotheses if existing_state else []
 
         def _check_cancel() -> bool:
-            return bool(_sessions.get(session_id, {}).get("cancel_requested"))
+            with _sessions_lock:
+                return bool(_sessions.get(session_id, {}).get("cancel_requested"))
 
         state = pipeline.run(
             order_codes=req.resolved_order_codes,
@@ -615,65 +634,79 @@ def _execute_pipeline(session_id: str, req: RunRequest):
             cancel_check=_check_cancel,
         )
 
-        if _sessions[session_id].get("cancel_requested"):
-            _sessions[session_id]["cancel_requested"] = False
-            _sessions[session_id]["status"] = "cancelled"
-            logger.info(f"Session {session_id} cancelled by user request")
-            _sessions[session_id]["state"] = state  # preserve partial results
+        # Persist core results immediately so a later design/meta-review failure
+        # cannot discard a finished Generate → Debate → Evolve run.
+        with _sessions_lock:
+            _sessions[session_id]["state"] = state
+            cancelled = bool(_sessions[session_id].get("cancel_requested"))
+            if cancelled:
+                _sessions[session_id]["cancel_requested"] = False
+                _sessions[session_id]["status"] = "cancelled"
             _save_sessions()
+
+        if cancelled:
+            logger.info(f"Session {session_id} cancelled by user request")
+            _save_results(session_id, state, settings.coscientist.output_dir)
             return
 
-        # Preserve diverse candidates for experimental design. Proximity does
-        # not discard any hypothesis; it only prioritises cluster representatives.
-        if settings.coscientist.proximity_enabled:
-            selected_hypotheses, state.diversity_summary = cluster_and_select_diverse_hypotheses(
-                state.hypotheses,
-                max_hypotheses=settings.coscientist.max_diverse_hypotheses,
-            )
-        else:
-            selected_hypotheses = state.hypotheses[:settings.coscientist.max_diverse_hypotheses]
+        post_error = None
+        try:
+            if settings.coscientist.proximity_enabled:
+                selected_hypotheses, state.diversity_summary = cluster_and_select_diverse_hypotheses(
+                    state.hypotheses,
+                    max_hypotheses=settings.coscientist.max_diverse_hypotheses,
+                )
+            else:
+                selected_hypotheses = state.hypotheses[:settings.coscientist.max_diverse_hypotheses]
 
-        designs = run_experiment_design(
-            hypotheses=selected_hypotheses,
-            llm=llm,
-            experimental_context=state.experimental_context,
-            top_n=len(selected_hypotheses),
-        )
-        state.experiment_designs = designs
-        state.evidence_graph = build_evidence_graph(
-            state.experimental_context,
-            state.hypotheses,
-            state.lab_results,
-        )
-        if settings.coscientist.meta_review_enabled:
-            state.meta_review = run_meta_review(
-                research_goal=state.research_goal,
+            designs = run_experiment_design(
                 hypotheses=selected_hypotheses,
-                evidence_graph_summary=state.evidence_graph.get("summary", {}),
-                experiment_designs=state.experiment_designs,
-                lab_results=state.lab_results,
-                scientist_feedback=state.scientist_feedback,
                 llm=llm,
+                experimental_context=state.experimental_context,
+                top_n=len(selected_hypotheses),
             )
+            state.experiment_designs = designs
+            state.evidence_graph = build_evidence_graph(
+                state.experimental_context,
+                state.hypotheses,
+                state.lab_results,
+            )
+            if settings.coscientist.meta_review_enabled:
+                state.meta_review = run_meta_review(
+                    research_goal=state.research_goal,
+                    hypotheses=selected_hypotheses,
+                    evidence_graph_summary=state.evidence_graph.get("summary", {}),
+                    experiment_designs=state.experiment_designs,
+                    lab_results=state.lab_results,
+                    scientist_feedback=state.scientist_feedback,
+                    llm=llm,
+                )
+        except Exception as exc:  # noqa: BLE001 - keep hypothesis results even if enrichment fails
+            logger.exception("Post-pipeline enrichment failed for session %s", session_id)
+            post_error = str(exc)
 
-        _sessions[session_id]["state"] = state
-        _sessions[session_id]["status"] = "completed"
         discussion_packet = build_discussion_evidence_packet(
             state,
             session_id=session_id,
             source_orders=_sessions[session_id].get("order_codes", []),
             created_at=_sessions[session_id].get("created_at"),
         )
-        _sessions[session_id]["_discussion_packet"] = discussion_packet
-        _save_sessions()
+        with _sessions_lock:
+            _sessions[session_id]["state"] = state
+            _sessions[session_id]["status"] = "completed"
+            _sessions[session_id]["error"] = f"Completed with warnings: {post_error}" if post_error else None
+            _sessions[session_id]["_discussion_packet"] = discussion_packet
+            _save_sessions()
 
-        # Save full operational results plus the report-safe evidence packet.
         _save_results(session_id, state, settings.coscientist.output_dir, discussion_packet)
 
     except Exception as e:
         logger.exception("Pipeline failed for session %s", session_id)
-        _sessions[session_id]["status"] = f"error: {e!s}"
-        _save_sessions()
+        with _sessions_lock:
+            if session_id in _sessions:
+                _sessions[session_id]["status"] = f"error: {e!s}"
+                _sessions[session_id]["error"] = str(e)
+                _save_sessions()
 
 
 def _create_llm(settings, llm_provider: str = "", llm_model: str = "") -> LLMClient:

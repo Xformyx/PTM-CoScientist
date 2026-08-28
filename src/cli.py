@@ -81,6 +81,7 @@ def run(order_code: str, goal: str, ptm_type: str, iterations: int, output: str)
         evidence_graph_enabled=settings.coscientist.evidence_graph_enabled,
         proximity_enabled=settings.coscientist.proximity_enabled,
         max_diverse_hypotheses=settings.coscientist.max_diverse_hypotheses,
+        max_hypotheses=settings.coscientist.max_hypotheses,
     )
 
     def progress(pct, msg):
